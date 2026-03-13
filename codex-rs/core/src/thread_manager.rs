@@ -23,6 +23,8 @@ use crate::rollout::RolloutRecorder;
 use crate::rollout::truncation;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillsManager;
+use crate::thread_merge::MergeSource;
+use crate::thread_merge::build_merged_rollout;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelPreset;
@@ -491,6 +493,33 @@ impl ThreadManager {
             self.agent_control(),
             Vec::new(),
             persist_extended_history,
+            None,
+            parent_trace,
+        ))
+        .await
+    }
+
+    pub async fn merge_threads(
+        &self,
+        base_thread_id: ThreadId,
+        config: Config,
+        base_path: PathBuf,
+        merge_sources: Vec<(ThreadId, PathBuf)>,
+        parent_trace: Option<W3cTraceContext>,
+    ) -> CodexResult<NewThread> {
+        let merge_sources: Vec<MergeSource> = merge_sources
+            .into_iter()
+            .map(|(thread_id, path)| MergeSource { thread_id, path })
+            .collect();
+        let history =
+            build_merged_rollout(base_thread_id, base_path.as_path(), &merge_sources).await?;
+        Box::pin(self.state.spawn_thread(
+            config,
+            InitialHistory::Forked(history),
+            Arc::clone(&self.state.auth_manager),
+            self.agent_control(),
+            Vec::new(),
+            false,
             None,
             parent_trace,
         ))

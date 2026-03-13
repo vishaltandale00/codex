@@ -80,6 +80,8 @@ pub enum RolloutRecorderParams {
     Create {
         conversation_id: ThreadId,
         forked_from_id: Option<ThreadId>,
+        merge_base_thread_id: Option<ThreadId>,
+        merged_from_thread_ids: Vec<ThreadId>,
         source: SessionSource,
         base_instructions: BaseInstructions,
         dynamic_tools: Vec<DynamicToolSpec>,
@@ -109,6 +111,8 @@ impl RolloutRecorderParams {
     pub fn new(
         conversation_id: ThreadId,
         forked_from_id: Option<ThreadId>,
+        merge_base_thread_id: Option<ThreadId>,
+        merged_from_thread_ids: Vec<ThreadId>,
         source: SessionSource,
         base_instructions: BaseInstructions,
         dynamic_tools: Vec<DynamicToolSpec>,
@@ -117,6 +121,8 @@ impl RolloutRecorderParams {
         Self::Create {
             conversation_id,
             forked_from_id,
+            merge_base_thread_id,
+            merged_from_thread_ids,
             source,
             base_instructions,
             dynamic_tools,
@@ -378,6 +384,8 @@ impl RolloutRecorder {
                 RolloutRecorderParams::Create {
                     conversation_id,
                     forked_from_id,
+                    merge_base_thread_id,
+                    merged_from_thread_ids,
                     source,
                     base_instructions,
                     dynamic_tools,
@@ -399,6 +407,9 @@ impl RolloutRecorder {
                     let session_meta = SessionMeta {
                         id: session_id,
                         forked_from_id,
+                        merge_base_thread_id,
+                        merged_from_thread_ids: (!merged_from_thread_ids.is_empty())
+                            .then_some(merged_from_thread_ids),
                         timestamp,
                         cwd: config.cwd.clone(),
                         originator: originator().value,
@@ -574,6 +585,9 @@ impl RolloutRecorder {
                     }
                     RolloutItem::EventMsg(_ev) => {
                         items.push(RolloutItem::EventMsg(_ev));
+                    }
+                    RolloutItem::MergeBoundary(item) => {
+                        items.push(RolloutItem::MergeBoundary(item));
                     }
                 },
                 Err(e) => {
@@ -1055,7 +1069,8 @@ async fn resume_candidate_matches_cwd(
             RolloutItem::SessionMeta(_)
             | RolloutItem::ResponseItem(_)
             | RolloutItem::Compacted(_)
-            | RolloutItem::EventMsg(_) => None,
+            | RolloutItem::EventMsg(_)
+            | RolloutItem::MergeBoundary(_) => None,
         })
     {
         return cwd_matches(latest_turn_context_cwd, cwd);

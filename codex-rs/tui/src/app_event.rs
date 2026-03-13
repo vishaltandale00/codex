@@ -96,8 +96,19 @@ pub(crate) enum AppEvent {
     /// Open the resume picker inside the running TUI session.
     OpenResumePicker,
 
+    /// Open the merge picker flow inside the running TUI session.
+    OpenMergePicker,
+
     /// Fork the current session into a new thread.
     ForkCurrentSession,
+
+    /// Merge descendant threads into a new thread forked from the selected base session.
+    MergeThreads {
+        base_thread_id: ThreadId,
+        base_path: PathBuf,
+        merge_thread_ids: Vec<ThreadId>,
+        cwd: PathBuf,
+    },
 
     /// Request to exit the application.
     ///

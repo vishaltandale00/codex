@@ -26,6 +26,7 @@ pub enum SlashCommand {
     Rename,
     New,
     Resume,
+    Merge,
     Fork,
     Init,
     Compact,
@@ -73,6 +74,7 @@ impl SlashCommand {
             SlashCommand::Review => "review my current changes and find issues",
             SlashCommand::Rename => "rename the current thread",
             SlashCommand::Resume => "resume a saved chat",
+            SlashCommand::Merge => "merge descendant chats into a new chat",
             SlashCommand::Clear => "clear the terminal and start a new chat",
             SlashCommand::Fork => "fork the current chat",
             // SlashCommand::Undo => "ask Codex to undo a turn",
@@ -135,6 +137,7 @@ impl SlashCommand {
         match self {
             SlashCommand::New
             | SlashCommand::Resume
+            | SlashCommand::Merge
             | SlashCommand::Fork
             | SlashCommand::Init
             | SlashCommand::Compact

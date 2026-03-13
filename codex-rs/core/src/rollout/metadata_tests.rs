@@ -33,6 +33,8 @@ async fn extract_metadata_from_rollout_uses_session_meta() {
     let session_meta = SessionMeta {
         id,
         forked_from_id: None,
+        merge_base_thread_id: None,
+        merged_from_thread_ids: None,
         timestamp: "2026-01-27T12:34:56Z".to_string(),
         cwd: dir.path().to_path_buf(),
         originator: "cli".to_string(),
@@ -83,6 +85,8 @@ async fn extract_metadata_from_rollout_returns_latest_memory_mode() {
     let session_meta = SessionMeta {
         id,
         forked_from_id: None,
+        merge_base_thread_id: None,
+        merged_from_thread_ids: None,
         timestamp: "2026-01-27T12:34:56Z".to_string(),
         cwd: dir.path().to_path_buf(),
         originator: "cli".to_string(),
@@ -350,6 +354,8 @@ fn write_rollout_in_sessions_with_cwd(
     let session_meta = SessionMeta {
         id,
         forked_from_id: None,
+        merge_base_thread_id: None,
+        merged_from_thread_ids: None,
         timestamp: event_ts.to_string(),
         cwd,
         originator: "cli".to_string(),

@@ -604,6 +604,8 @@ mod tests {
     use super::*;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
     use codex_app_server_protocol::SessionSource as ApiSessionSource;
+    use codex_app_server_protocol::ThreadMergeParams;
+    use codex_app_server_protocol::ThreadMergeResponse;
     use codex_app_server_protocol::ThreadStartParams;
     use codex_app_server_protocol::ThreadStartResponse;
     use codex_core::config::ConfigBuilder;
@@ -700,6 +702,24 @@ mod tests {
             assert_eq!(parsed.thread.source, expected_source);
             client.shutdown().await.expect("shutdown should complete");
         }
+    }
+
+    #[tokio::test]
+    async fn typed_thread_merge_request_reports_server_errors() {
+        let client = start_test_client(SessionSource::Exec).await;
+        let err = client
+            .request_typed::<ThreadMergeResponse>(ClientRequest::ThreadMerge {
+                request_id: RequestId::Integer(100),
+                params: ThreadMergeParams {
+                    base_thread_id: "missing-base".to_string(),
+                    merge_thread_ids: vec!["missing-child".to_string()],
+                    ..ThreadMergeParams::default()
+                },
+            })
+            .await
+            .expect_err("missing thread merge should error");
+        assert!(err.to_string().starts_with("thread/merge failed:"));
+        client.shutdown().await.expect("shutdown should complete");
     }
 
     #[tokio::test]

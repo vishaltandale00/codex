@@ -2556,6 +2556,8 @@ mod tests {
         SessionConfiguredEvent {
             session_id: ThreadId::new(),
             forked_from_id: None,
+            merge_base_thread_id: None,
+            merged_from_thread_ids: Vec::new(),
             thread_name: None,
             model: model.to_string(),
             model_provider_id: "test-provider".to_string(),

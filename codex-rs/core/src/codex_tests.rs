@@ -1728,6 +1728,8 @@ async fn attach_rollout_recorder(session: &Arc<Session>) -> PathBuf {
         RolloutRecorderParams::new(
             ThreadId::default(),
             None,
+            None,
+            Vec::new(),
             SessionSource::Exec,
             BaseInstructions::default(),
             Vec::new(),
@@ -3386,6 +3388,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_baseline
         RolloutRecorderParams::new(
             ThreadId::default(),
             None,
+            None,
+            Vec::new(),
             SessionSource::Exec,
             BaseInstructions::default(),
             Vec::new(),
@@ -3483,6 +3487,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_full_rei
         RolloutRecorderParams::new(
             ThreadId::default(),
             None,
+            None,
+            Vec::new(),
             SessionSource::Exec,
             BaseInstructions::default(),
             Vec::new(),

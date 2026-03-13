@@ -56,6 +56,8 @@ pub(crate) use approval_overlay::ApprovalRequest;
 pub(crate) use approval_overlay::format_requested_permissions_rule;
 pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
 pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
+pub(crate) use multi_select_picker::MultiSelectItem;
+pub(crate) use multi_select_picker::MultiSelectPicker;
 pub(crate) use request_user_input::RequestUserInputOverlay;
 mod bottom_pane_view;
 
@@ -783,6 +785,10 @@ impl BottomPane {
     pub(crate) fn show_selection_view(&mut self, params: list_selection_view::SelectionViewParams) {
         let view = list_selection_view::ListSelectionView::new(params, self.app_event_tx.clone());
         self.push_view(Box::new(view));
+    }
+
+    pub(crate) fn show_multi_select_picker(&mut self, picker: MultiSelectPicker) {
+        self.push_view(Box::new(picker));
     }
 
     /// Replace the active selection view when it matches `view_id`.

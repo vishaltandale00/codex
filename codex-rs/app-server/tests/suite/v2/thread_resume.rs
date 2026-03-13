@@ -317,6 +317,8 @@ stream_max_retries = 0
     let session_meta = SessionMeta {
         id: conversation_id,
         forked_from_id: None,
+        merge_base_thread_id: None,
+        merged_from_thread_ids: None,
         timestamp: "2025-01-05T12:00:00Z".to_string(),
         cwd: repo_path.clone(),
         originator: "codex".to_string(),

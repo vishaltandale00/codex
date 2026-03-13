@@ -8,6 +8,7 @@ use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::FeedbackAudience;
 use crate::bottom_pane::McpServerElicitationFormRequest;
+use crate::bottom_pane::MultiSelectItem;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
@@ -42,7 +43,10 @@ use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
+use codex_core::INTERACTIVE_SESSION_SOURCES;
+use codex_core::RolloutRecorder;
 use codex_core::ThreadManager;
+use codex_core::ThreadSortKey;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -120,6 +124,8 @@ use self::pending_interactive_replay::PendingInteractiveReplayState;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
+
+const MERGE_PICKER_PAGE_SIZE: usize = 100;
 
 enum ThreadInteractiveRequest {
     Approval(ApprovalRequest),
@@ -252,6 +258,89 @@ fn emit_project_config_warnings(app_event_tx: &AppEventSender, config: &Config) 
     app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
         history_cell::new_warning_event(message),
     )));
+}
+
+async fn collect_merge_picker_items(
+    config: &Config,
+    base_thread_id: ThreadId,
+) -> Result<Vec<MultiSelectItem>> {
+    let mut cursor = None;
+    let mut items = Vec::new();
+
+    loop {
+        let page = RolloutRecorder::list_threads(
+            config,
+            MERGE_PICKER_PAGE_SIZE,
+            cursor.as_ref(),
+            ThreadSortKey::UpdatedAt,
+            INTERACTIVE_SESSION_SOURCES,
+            None,
+            config.model_provider_id.as_str(),
+            None,
+        )
+        .await?;
+
+        for thread in &page.items {
+            let Some(thread_id) = thread.thread_id else {
+                continue;
+            };
+            if thread_id == base_thread_id {
+                continue;
+            }
+            if !is_descendant_thread(config, base_thread_id, thread.path.as_path()).await {
+                continue;
+            }
+
+            let name = thread
+                .first_user_message
+                .clone()
+                .unwrap_or_else(|| thread_id.to_string());
+            let description = thread.cwd.as_ref().map(|cwd| cwd.display().to_string());
+            items.push(MultiSelectItem {
+                id: thread_id.to_string(),
+                name,
+                description,
+                enabled: false,
+            });
+        }
+
+        if let Some(next_cursor) = page.next_cursor {
+            cursor = Some(next_cursor);
+        } else {
+            break;
+        }
+    }
+
+    Ok(items)
+}
+
+async fn is_descendant_thread(config: &Config, base_thread_id: ThreadId, path: &Path) -> bool {
+    let mut current_path = path.to_path_buf();
+    let mut seen = HashSet::<ThreadId>::new();
+
+    loop {
+        let Ok(session_meta_line) = crate::read_session_meta_line(&current_path).await else {
+            return false;
+        };
+        let Some(parent_thread_id) = session_meta_line.meta.forked_from_id else {
+            return false;
+        };
+        if parent_thread_id == base_thread_id {
+            return true;
+        }
+        if !seen.insert(parent_thread_id) {
+            return false;
+        }
+        let Ok(Some(parent_path)) = codex_core::find_thread_path_by_id_str(
+            &config.codex_home,
+            &parent_thread_id.to_string(),
+        )
+        .await
+        else {
+            return false;
+        };
+        current_path = parent_path;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2240,6 +2329,60 @@ impl App {
                 // Leaving alt-screen may blank the inline viewport; force a redraw either way.
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::OpenMergePicker => {
+                match crate::resume_picker::run_resume_picker(tui, &self.config, false).await? {
+                    SessionSelection::Resume(target_session) => {
+                        let current_cwd = self.config.cwd.clone();
+                        let merge_cwd = match crate::resolve_cwd_for_resume_or_fork(
+                            tui,
+                            &self.config,
+                            &current_cwd,
+                            target_session.thread_id,
+                            &target_session.path,
+                            CwdPromptAction::Fork,
+                            true,
+                        )
+                        .await?
+                        {
+                            crate::ResolveCwdOutcome::Continue(Some(cwd)) => cwd,
+                            crate::ResolveCwdOutcome::Continue(None) => current_cwd.clone(),
+                            crate::ResolveCwdOutcome::Exit => {
+                                return Ok(AppRunControl::Exit(ExitReason::UserRequested));
+                            }
+                        };
+                        match collect_merge_picker_items(&self.config, target_session.thread_id)
+                            .await
+                        {
+                            Ok(items) if items.is_empty() => {
+                                self.chat_widget.add_error_message(format!(
+                                    "No descendant threads are available to merge into {}.",
+                                    target_session.thread_id
+                                ));
+                            }
+                            Ok(items) => {
+                                self.chat_widget
+                                    .add_plain_history_lines(vec!["/merge".magenta().into()]);
+                                self.chat_widget.show_merge_picker(
+                                    target_session.thread_id,
+                                    target_session.path,
+                                    merge_cwd,
+                                    items,
+                                );
+                            }
+                            Err(err) => {
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to open merge picker: {err}"
+                                ));
+                            }
+                        }
+                    }
+                    SessionSelection::Exit
+                    | SessionSelection::StartFresh
+                    | SessionSelection::Fork(_) => {}
+                }
+
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::ForkCurrentSession => {
                 self.session_telemetry.counter(
                     "codex.thread.fork",
@@ -2307,6 +2450,102 @@ impl App {
                         "A thread must contain at least one turn before it can be forked."
                             .to_string(),
                     );
+                }
+
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::MergeThreads {
+                base_thread_id,
+                base_path,
+                merge_thread_ids,
+                cwd,
+            } => {
+                if merge_thread_ids.is_empty() {
+                    self.chat_widget.add_error_message(
+                        "Select at least one descendant thread to merge.".to_string(),
+                    );
+                    tui.frame_requester().schedule_frame();
+                    return Ok(AppRunControl::Continue);
+                }
+
+                self.refresh_in_memory_config_from_disk_best_effort("merging threads")
+                    .await;
+                let current_cwd = self.config.cwd.clone();
+                let mut merge_config = match self
+                    .rebuild_config_for_resume_or_fallback(&current_cwd, cwd)
+                    .await
+                {
+                    Ok(cfg) => cfg,
+                    Err(err) => {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to rebuild configuration for merge: {err}"
+                        ));
+                        tui.frame_requester().schedule_frame();
+                        return Ok(AppRunControl::Continue);
+                    }
+                };
+                self.apply_runtime_policy_overrides(&mut merge_config);
+                let summary = session_summary(
+                    self.chat_widget.token_usage(),
+                    self.chat_widget.thread_id(),
+                    self.chat_widget.thread_name(),
+                );
+                let mut merge_sources = Vec::new();
+                for merge_thread_id in merge_thread_ids {
+                    let Some(path) = codex_core::find_thread_path_by_id_str(
+                        &self.config.codex_home,
+                        &merge_thread_id.to_string(),
+                    )
+                    .await?
+                    else {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to find rollout for merge thread {merge_thread_id}."
+                        ));
+                        tui.frame_requester().schedule_frame();
+                        return Ok(AppRunControl::Continue);
+                    };
+                    merge_sources.push((merge_thread_id, path));
+                }
+
+                match self
+                    .server
+                    .merge_threads(
+                        base_thread_id,
+                        merge_config.clone(),
+                        base_path,
+                        merge_sources,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(merged) => {
+                        self.shutdown_current_thread().await;
+                        self.config = merge_config;
+                        tui.set_notification_method(self.config.tui_notification_method);
+                        self.file_search.update_search_dir(self.config.cwd.clone());
+                        let init = self
+                            .chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
+                        self.chat_widget = ChatWidget::new_from_existing(
+                            init,
+                            merged.thread,
+                            merged.session_configured,
+                        );
+                        self.reset_thread_event_state();
+                        if let Some(summary) = summary {
+                            let mut lines: Vec<Line<'static>> =
+                                vec![summary.usage_line.clone().into()];
+                            if let Some(command) = summary.resume_command {
+                                let spans =
+                                    vec!["To continue this session, run ".into(), command.cyan()];
+                                lines.push(spans.into());
+                            }
+                            self.chat_widget.add_plain_history_lines(lines);
+                        }
+                    }
+                    Err(err) => {
+                        self.chat_widget
+                            .add_error_message(format!("Failed to merge threads: {err}"));
+                    }
                 }
 
                 tui.frame_requester().schedule_frame();
@@ -3535,6 +3774,8 @@ impl App {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: config_snapshot.model,
                 model_provider_id: config_snapshot.model_provider_id,
@@ -3897,6 +4138,8 @@ mod tests {
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionConfiguredEvent;
+    use codex_protocol::protocol::SessionMeta;
+    use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadRolledBackEvent;
     use codex_protocol::protocol::TurnAbortReason;
@@ -3910,6 +4153,7 @@ mod tests {
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
     use ratatui::prelude::Line;
+    use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -3933,6 +4177,78 @@ mod tests {
             vec![base_cwd.join("rel")]
         );
         Ok(())
+    }
+
+    fn write_merge_picker_rollout(
+        codex_home: &std::path::Path,
+        filename_ts: &str,
+        thread_id: ThreadId,
+        parent_thread_id: Option<ThreadId>,
+        preview: &str,
+        provider: &str,
+    ) -> Result<PathBuf> {
+        let year = &filename_ts[0..4];
+        let month = &filename_ts[5..7];
+        let day = &filename_ts[8..10];
+        let dir = codex_home.join("sessions").join(year).join(month).join(day);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("rollout-{filename_ts}-{thread_id}.jsonl"));
+        let timestamp = "2026-01-01T00:00:00Z";
+        let payload = serde_json::to_value(SessionMetaLine {
+            meta: SessionMeta {
+                id: thread_id,
+                forked_from_id: parent_thread_id,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: None,
+                timestamp: timestamp.to_string(),
+                cwd: PathBuf::from("/tmp/project"),
+                originator: "test".to_string(),
+                cli_version: "0.0.0".to_string(),
+                source: SessionSource::Cli,
+                agent_nickname: None,
+                agent_role: None,
+                model_provider: Some(provider.to_string()),
+                base_instructions: None,
+                dynamic_tools: None,
+                memory_mode: None,
+            },
+            git: None,
+        })?;
+        let lines = vec![
+            json!({
+                "timestamp": timestamp,
+                "type": "session_meta",
+                "payload": payload,
+            }),
+            json!({
+                "timestamp": timestamp,
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": preview}],
+                },
+            }),
+            json!({
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": preview,
+                    "kind": "plain",
+                },
+            }),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )?;
+        Ok(path)
     }
 
     #[test]
@@ -4018,6 +4334,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_merge_picker_items_includes_cross_provider_descendants() -> Result<()> {
+        let codex_home = tempdir()?;
+        let base_thread_id = ThreadId::new();
+        let other_thread_id = ThreadId::new();
+        write_merge_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-00-00",
+            base_thread_id,
+            None,
+            "base thread",
+            "primary-provider",
+        )?;
+        write_merge_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-01-00",
+            other_thread_id,
+            Some(base_thread_id),
+            "cross provider descendant",
+            "secondary-provider",
+        )?;
+
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        config.codex_home = codex_home.path().to_path_buf();
+        config.model_provider_id = "primary-provider".to_string();
+
+        let items = collect_merge_picker_items(&config, base_thread_id).await?;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, other_thread_id.to_string());
+        assert_eq!(items[0].name, "cross provider descendant");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn enqueue_primary_event_delivers_session_configured_before_buffered_approval()
     -> Result<()> {
         let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
@@ -4047,6 +4400,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -4219,6 +4574,8 @@ mod tests {
                     msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                         session_id: thread_id,
                         forked_from_id: None,
+                        merge_base_thread_id: None,
+                        merged_from_thread_ids: Vec::new(),
                         thread_name: None,
                         model: "gpt-test".to_string(),
                         model_provider_id: "test-provider".to_string(),
@@ -4296,6 +4653,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -4377,6 +4736,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -4457,6 +4818,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -4531,6 +4894,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -4644,6 +5009,8 @@ mod tests {
                     msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                         session_id: thread_id,
                         forked_from_id: None,
+                        merge_base_thread_id: None,
+                        merged_from_thread_ids: Vec::new(),
                         thread_name: None,
                         model: "gpt-test".to_string(),
                         model_provider_id: "test-provider".to_string(),
@@ -4713,6 +5080,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -4816,6 +5185,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -4892,6 +5263,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -5247,6 +5620,8 @@ mod tests {
                     msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                         session_id: agent_thread_id,
                         forked_from_id: None,
+                        merge_base_thread_id: None,
+                        merged_from_thread_ids: Vec::new(),
                         thread_name: None,
                         model: "gpt-5".to_string(),
                         model_provider_id: "test-provider".to_string(),
@@ -5467,6 +5842,8 @@ mod tests {
             let event = SessionConfiguredEvent {
                 session_id: ThreadId::new(),
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -6117,6 +6494,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: ThreadId::new(),
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -6232,6 +6611,8 @@ mod tests {
             let event = SessionConfiguredEvent {
                 session_id: ThreadId::new(),
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -6291,6 +6672,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: base_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -6383,6 +6766,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -6448,6 +6833,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -6528,6 +6915,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -6655,6 +7044,8 @@ mod tests {
         let event = SessionConfiguredEvent {
             session_id: thread_id,
             forked_from_id: None,
+            merge_base_thread_id: None,
+            merged_from_thread_ids: Vec::new(),
             thread_name: None,
             model: "gpt-test".to_string(),
             model_provider_id: "test-provider".to_string(),
@@ -6724,6 +7115,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: Some("keep me".to_string()),
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),

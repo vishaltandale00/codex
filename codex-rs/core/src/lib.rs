@@ -90,10 +90,13 @@ pub mod review_format;
 pub mod review_prompts;
 mod seatbelt_permissions;
 mod thread_manager;
+mod thread_merge;
 pub mod web_search;
 pub mod windows_sandbox_read_grants;
 pub use thread_manager::NewThread;
 pub use thread_manager::ThreadManager;
+pub use thread_merge::MergeSource;
+pub use thread_merge::build_merged_rollout;
 #[deprecated(note = "use ThreadManager")]
 pub type ConversationManager = ThreadManager;
 #[deprecated(note = "use NewThread")]

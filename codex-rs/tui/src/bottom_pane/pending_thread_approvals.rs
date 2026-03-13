@@ -118,9 +118,10 @@ mod tests {
 
         assert_snapshot!(
             snapshot_rows(&widget, 40).replace(' ', "."),
-            @r"
-..!.Approval.needed.in.Robie.[explorer].
-..../agent.to.switch.threads............"
+            @"
+        ..!.Approval.needed.in.Robie.[explorer].
+        ..../agent.to.switch.threads............
+        "
         );
     }
 
@@ -136,12 +137,13 @@ mod tests {
 
         assert_snapshot!(
             snapshot_rows(&widget, 44).replace(' ', "."),
-            @r"
-..!.Approval.needed.in.Main.[default].......
-..!.Approval.needed.in.Robie.[explorer].....
-..!.Approval.needed.in.Inspector............
-............................................
-..../agent.to.switch.threads................"
+            @"
+        ..!.Approval.needed.in.Main.[default].......
+        ..!.Approval.needed.in.Robie.[explorer].....
+        ..!.Approval.needed.in.Inspector............
+        ............................................
+        ..../agent.to.switch.threads................
+        "
         );
     }
 }

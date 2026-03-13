@@ -229,6 +229,8 @@ use crate::bottom_pane::InputResult;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::McpServerElicitationFormRequest;
 use crate::bottom_pane::MentionBinding;
+use crate::bottom_pane::MultiSelectItem;
+use crate::bottom_pane::MultiSelectPicker;
 use crate::bottom_pane::QUIT_SHORTCUT_TIMEOUT;
 use crate::bottom_pane::SelectionAction;
 use crate::bottom_pane::SelectionItem;
@@ -3928,6 +3930,37 @@ impl ChatWidget {
         self.request_redraw();
     }
 
+    pub(crate) fn show_merge_picker(
+        &mut self,
+        base_thread_id: ThreadId,
+        base_path: PathBuf,
+        cwd: PathBuf,
+        items: Vec<MultiSelectItem>,
+    ) {
+        let picker = MultiSelectPicker::builder(
+            format!("Merge into {base_thread_id}"),
+            Some("Select descendant threads. Use left/right to reorder blocks.".to_string()),
+            self.app_event_tx.clone(),
+        )
+        .items(items)
+        .enable_ordering()
+        .on_confirm(move |selected_ids, tx| {
+            let merge_thread_ids = selected_ids
+                .iter()
+                .filter_map(|id| ThreadId::from_string(id).ok())
+                .collect();
+            tx.send(AppEvent::MergeThreads {
+                base_thread_id,
+                base_path: base_path.clone(),
+                merge_thread_ids,
+                cwd: cwd.clone(),
+            });
+        })
+        .build();
+        self.bottom_pane.show_multi_select_picker(picker);
+        self.request_redraw();
+    }
+
     pub(crate) fn no_modal_or_popup_active(&self) -> bool {
         self.bottom_pane.no_modal_or_popup_active()
     }
@@ -3982,6 +4015,9 @@ impl ChatWidget {
             }
             SlashCommand::Resume => {
                 self.app_event_tx.send(AppEvent::OpenResumePicker);
+            }
+            SlashCommand::Merge => {
+                self.app_event_tx.send(AppEvent::OpenMergePicker);
             }
             SlashCommand::Fork => {
                 self.app_event_tx.send(AppEvent::ForkCurrentSession);

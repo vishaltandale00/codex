@@ -134,6 +134,8 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                 meta: SessionMeta {
                     id: thread_id,
                     forked_from_id: None,
+                    merge_base_thread_id: None,
+                    merged_from_thread_ids: None,
                     timestamp: "2026-01-27T12:00:00Z".to_string(),
                     cwd: codex_home.to_path_buf(),
                     originator: "test".to_string(),

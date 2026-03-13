@@ -91,6 +91,8 @@ fn session_configured_produces_thread_started_event() {
         EventMsg::SessionConfigured(SessionConfiguredEvent {
             session_id,
             forked_from_id: None,
+            merge_base_thread_id: None,
+            merged_from_thread_ids: Vec::new(),
             thread_name: None,
             model: "codex-mini-latest".to_string(),
             model_provider_id: "test-provider".to_string(),

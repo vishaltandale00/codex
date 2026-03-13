@@ -184,7 +184,8 @@ impl ThreadHistoryBuilder {
             RolloutItem::Compacted(payload) => self.handle_compacted(payload),
             RolloutItem::TurnContext(_)
             | RolloutItem::SessionMeta(_)
-            | RolloutItem::ResponseItem(_) => {}
+            | RolloutItem::ResponseItem(_)
+            | RolloutItem::MergeBoundary(_) => {}
         }
     }
 

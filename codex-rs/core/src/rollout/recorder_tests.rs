@@ -64,6 +64,8 @@ async fn recorder_materializes_only_after_explicit_persist() -> std::io::Result<
         RolloutRecorderParams::new(
             thread_id,
             None,
+            None,
+            Vec::new(),
             SessionSource::Exec,
             BaseInstructions::default(),
             Vec::new(),
@@ -163,6 +165,8 @@ async fn metadata_irrelevant_events_touch_state_db_updated_at() -> std::io::Resu
         RolloutRecorderParams::new(
             thread_id,
             None,
+            None,
+            Vec::new(),
             SessionSource::Cli,
             BaseInstructions::default(),
             Vec::new(),

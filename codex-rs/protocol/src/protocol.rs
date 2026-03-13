@@ -2184,6 +2184,49 @@ impl InitialHistory {
             }),
         }
     }
+
+    pub fn merge_base_thread_id(&self) -> Option<ThreadId> {
+        match self {
+            InitialHistory::New => None,
+            InitialHistory::Resumed(resumed) => {
+                resumed.history.iter().find_map(|item| match item {
+                    RolloutItem::SessionMeta(meta_line) => meta_line.meta.merge_base_thread_id,
+                    _ => None,
+                })
+            }
+            InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
+                RolloutItem::SessionMeta(meta_line) => meta_line.meta.merge_base_thread_id,
+                _ => None,
+            }),
+        }
+    }
+
+    pub fn merged_from_thread_ids(&self) -> Vec<ThreadId> {
+        let items = match self {
+            InitialHistory::New => return Vec::new(),
+            InitialHistory::Resumed(resumed) => &resumed.history,
+            InitialHistory::Forked(items) => items,
+        };
+
+        let mut ids = items
+            .iter()
+            .find_map(|item| match item {
+                RolloutItem::SessionMeta(meta_line) => {
+                    meta_line.meta.merged_from_thread_ids.clone()
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut seen: HashSet<ThreadId> = ids.iter().copied().collect();
+        for item in items {
+            if let RolloutItem::MergeBoundary(boundary) = item
+                && seen.insert(boundary.source_thread_id)
+            {
+                ids.push(boundary.source_thread_id);
+            }
+        }
+        ids
+    }
 }
 
 fn session_cwd_from_items(items: &[RolloutItem]) -> Option<PathBuf> {
@@ -2292,6 +2335,10 @@ pub struct SessionMeta {
     pub id: ThreadId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forked_from_id: Option<ThreadId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_base_thread_id: Option<ThreadId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_from_thread_ids: Option<Vec<ThreadId>>,
     pub timestamp: String,
     pub cwd: PathBuf,
     pub originator: String,
@@ -2320,6 +2367,8 @@ impl Default for SessionMeta {
         SessionMeta {
             id: ThreadId::default(),
             forked_from_id: None,
+            merge_base_thread_id: None,
+            merged_from_thread_ids: None,
             timestamp: String::new(),
             cwd: PathBuf::new(),
             originator: String::new(),
@@ -2347,10 +2396,16 @@ pub struct SessionMetaLine {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RolloutItem {
     SessionMeta(SessionMetaLine),
+    MergeBoundary(MergeBoundaryItem),
     ResponseItem(ResponseItem),
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
     EventMsg(EventMsg),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
+pub struct MergeBoundaryItem {
+    pub source_thread_id: ThreadId,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
@@ -2977,6 +3032,10 @@ pub struct SessionConfiguredEvent {
     pub session_id: ThreadId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forked_from_id: Option<ThreadId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_base_thread_id: Option<ThreadId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_from_thread_ids: Vec<ThreadId>,
 
     /// Optional user-facing thread name (may be unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4226,6 +4285,8 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: conversation_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "codex-mini-latest".to_string(),
                 model_provider_id: "openai".to_string(),
