@@ -2207,6 +2207,10 @@ impl InitialHistory {
             InitialHistory::Resumed(resumed) => &resumed.history,
             InitialHistory::Forked(items) => items,
         };
+        let session_id = items.iter().find_map(|item| match item {
+            RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.id),
+            _ => None,
+        });
 
         let mut ids = items
             .iter()
@@ -2220,6 +2224,7 @@ impl InitialHistory {
         let mut seen: HashSet<ThreadId> = ids.iter().copied().collect();
         for item in items {
             if let RolloutItem::MergeBoundary(boundary) = item
+                && Some(boundary.source_thread_id) != session_id
                 && seen.insert(boundary.source_thread_id)
             {
                 ids.push(boundary.source_thread_id);

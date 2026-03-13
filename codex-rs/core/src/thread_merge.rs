@@ -63,7 +63,10 @@ pub async fn build_merged_rollout(
             continue;
         }
 
-        let cut_idx = source_turns[inherited_turn_count].start_idx;
+        let cut_idx = suffix_start_idx(
+            source_items.as_slice(),
+            source_turns[inherited_turn_count].start_idx,
+        );
         for block in suffix_blocks(source.thread_id, source_items, cut_idx) {
             if !covered_source_ids.insert(block.source_thread_id) {
                 continue;
@@ -89,9 +92,13 @@ async fn load_rollout_items(path: &Path) -> CodexResult<Vec<RolloutItem>> {
 fn effective_turns(items: &[RolloutItem]) -> Vec<EffectiveTurn> {
     let mut turns = Vec::new();
     let mut active_turn: Option<EffectiveTurn> = None;
+    let mut pending_start_idx: Option<usize> = None;
 
     for (idx, item) in items.iter().enumerate() {
         match item {
+            RolloutItem::Compacted(_) | RolloutItem::TurnContext(_) if active_turn.is_none() => {
+                pending_start_idx.get_or_insert(idx);
+            }
             RolloutItem::ResponseItem(response_item) => {
                 if matches!(
                     parse_turn_item(response_item),
@@ -101,7 +108,7 @@ fn effective_turns(items: &[RolloutItem]) -> Vec<EffectiveTurn> {
                         turns.push(turn);
                     }
                     active_turn = Some(EffectiveTurn {
-                        start_idx: idx,
+                        start_idx: pending_start_idx.take().unwrap_or(idx),
                         signature: vec![response_item.clone()],
                     });
                 } else if let Some(turn) = active_turn.as_mut() {
@@ -115,6 +122,7 @@ fn effective_turns(items: &[RolloutItem]) -> Vec<EffectiveTurn> {
                 let num_turns = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
                 let new_len = turns.len().saturating_sub(num_turns);
                 turns.truncate(new_len);
+                pending_start_idx = None;
             }
             _ => {}
         }
@@ -134,11 +142,36 @@ fn longest_common_prefix_len(lhs: &[EffectiveTurn], rhs: &[EffectiveTurn]) -> us
         .count()
 }
 
+fn suffix_start_idx(items: &[RolloutItem], start_idx: usize) -> usize {
+    let mut idx = start_idx;
+    while idx > 0
+        && matches!(
+            items.get(idx - 1),
+            Some(
+                RolloutItem::MergeBoundary(_)
+                    | RolloutItem::Compacted(_)
+                    | RolloutItem::TurnContext(_)
+            )
+        )
+    {
+        idx -= 1;
+    }
+    idx
+}
+
 fn covered_source_ids(items: &[RolloutItem]) -> HashSet<ThreadId> {
+    let session_id = items.iter().find_map(|item| match item {
+        RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.id),
+        _ => None,
+    });
     items
         .iter()
         .filter_map(|item| match item {
-            RolloutItem::MergeBoundary(boundary) => Some(boundary.source_thread_id),
+            RolloutItem::MergeBoundary(boundary)
+                if Some(boundary.source_thread_id) != session_id =>
+            {
+                Some(boundary.source_thread_id)
+            }
             _ => None,
         })
         .collect()
@@ -247,6 +280,7 @@ mod tests {
     use codex_protocol::ThreadId;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
+    use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::MergeBoundaryItem;
     use codex_protocol::protocol::RolloutItem;
@@ -656,6 +690,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_rollout_keeps_compaction_before_first_divergent_turn() {
+        let temp = TempDir::new().expect("tempdir");
+        let base_id = thread_id();
+        let shared_turn = TestTurn {
+            user: "base",
+            assistant: "base answer",
+        };
+        let base_path = write_rollout(temp.path(), base_id, None, &[shared_turn]);
+        let branch_id = thread_id();
+        let branch_path = write_rollout_items(temp.path(), branch_id, Some(base_id), {
+            let mut items = rollout_items_for_turns(&[shared_turn]);
+            items.push(RolloutItem::Compacted(CompactedItem {
+                message: "summary".to_string(),
+                replacement_history: Some(Vec::new()),
+            }));
+            items.extend(rollout_items_for_turns(&[TestTurn {
+                user: "branch",
+                assistant: "branch answer",
+            }]));
+            items
+        });
+
+        let merged = build_merged_rollout(
+            base_id,
+            base_path.as_path(),
+            &[MergeSource {
+                thread_id: branch_id,
+                path: branch_path,
+            }],
+        )
+        .await
+        .expect("merge");
+
+        let boundary_idx = merged
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    RolloutItem::MergeBoundary(MergeBoundaryItem { source_thread_id })
+                    if *source_thread_id == branch_id
+                )
+            })
+            .expect("merge boundary");
+        let compacted_idx = merged
+            .iter()
+            .position(|item| matches!(item, RolloutItem::Compacted(_)))
+            .expect("compacted item");
+        let branch_turn_idx = merged
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. })
+                    if role == "user"
+                        && matches!(
+                            content.as_slice(),
+                            [ContentItem::InputText { text }] if text == "branch"
+                        )
+                )
+            })
+            .expect("branch turn");
+
+        assert!(boundary_idx < compacted_idx);
+        assert!(compacted_idx < branch_turn_idx);
+    }
+
+    #[tokio::test]
     async fn merge_rollout_skips_duplicate_blocks_from_prior_merged_descendant() {
         let temp = TempDir::new().expect("tempdir");
         let base_id = thread_id();
@@ -805,6 +906,91 @@ mod tests {
                 "base answer".to_string(),
                 "a answer".to_string(),
                 "c answer".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_rollout_preserves_native_turns_after_nested_merge_blocks() {
+        let temp = TempDir::new().expect("tempdir");
+        let base_id = thread_id();
+        let base_path = write_rollout(
+            temp.path(),
+            base_id,
+            None,
+            &[TestTurn {
+                user: "base",
+                assistant: "base answer",
+            }],
+        );
+        let a_id = thread_id();
+        write_rollout(
+            temp.path(),
+            a_id,
+            Some(base_id),
+            &[TestTurn {
+                user: "a",
+                assistant: "a answer",
+            }],
+        );
+        let c_id = thread_id();
+        let c_path = write_rollout(
+            temp.path(),
+            c_id,
+            Some(base_id),
+            &[TestTurn {
+                user: "c",
+                assistant: "c answer",
+            }],
+        );
+        let merged_ac_id = thread_id();
+        let merged_ac_path = write_rollout_items(
+            temp.path(),
+            merged_ac_id,
+            Some(base_id),
+            vec![
+                RolloutItem::MergeBoundary(MergeBoundaryItem {
+                    source_thread_id: a_id,
+                }),
+                rollout_line_message("user", "a").item,
+                rollout_line_message("assistant", "a answer").item,
+                RolloutItem::MergeBoundary(MergeBoundaryItem {
+                    source_thread_id: c_id,
+                }),
+                rollout_line_message("user", "c").item,
+                rollout_line_message("assistant", "c answer").item,
+                RolloutItem::MergeBoundary(MergeBoundaryItem {
+                    source_thread_id: merged_ac_id,
+                }),
+                rollout_line_message("user", "merged follow-up").item,
+                rollout_line_message("assistant", "merged follow-up answer").item,
+            ],
+        );
+
+        let merged = build_merged_rollout(
+            base_id,
+            base_path.as_path(),
+            &[
+                MergeSource {
+                    thread_id: c_id,
+                    path: c_path,
+                },
+                MergeSource {
+                    thread_id: merged_ac_id,
+                    path: merged_ac_path,
+                },
+            ],
+        )
+        .await
+        .expect("merge");
+
+        assert_eq!(
+            response_texts(&merged, "assistant"),
+            vec![
+                "base answer".to_string(),
+                "c answer".to_string(),
+                "a answer".to_string(),
+                "merged follow-up answer".to_string(),
             ]
         );
     }
