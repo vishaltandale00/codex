@@ -8296,6 +8296,8 @@ fn preview_from_rollout_items(items: &[RolloutItem]) -> String {
 
 async fn is_descendant_thread(codex_home: &Path, base_thread_id: ThreadId, path: &Path) -> bool {
     let mut current_path = path.to_path_buf();
+    let mut seen = HashSet::new();
+
     loop {
         let Ok(meta_line) = read_session_meta_line(current_path.as_path()).await else {
             return false;
@@ -8305,6 +8307,9 @@ async fn is_descendant_thread(codex_home: &Path, base_thread_id: ThreadId, path:
         };
         if parent_thread_id == base_thread_id {
             return true;
+        }
+        if !seen.insert(parent_thread_id) {
+            return false;
         }
         let Ok(Some(parent_path)) =
             find_thread_path_by_id_str(codex_home, &parent_thread_id.to_string()).await

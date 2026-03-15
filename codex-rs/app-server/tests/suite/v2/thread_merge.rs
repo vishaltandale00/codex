@@ -9,16 +9,20 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadMergeParams;
 use codex_app_server_protocol::ThreadMergeResponse;
+use codex_app_server_protocol::ThreadReadParams;
+use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::UserInput;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
@@ -167,6 +171,34 @@ fn create_rollout_with_turns(
     Ok(thread_id)
 }
 
+fn append_rollout_item(
+    codex_home: &Path,
+    filename_ts: &str,
+    thread_id: &str,
+    item: RolloutItem,
+) -> Result<()> {
+    let file_path = rollout_path(codex_home, filename_ts, thread_id);
+    let text = std::fs::read_to_string(&file_path)?;
+    let mut lines: Vec<RolloutLine> = text
+        .lines()
+        .map(serde_json::from_str::<RolloutLine>)
+        .collect::<Result<_, _>>()?;
+    lines.push(RolloutLine {
+        timestamp: "2025-01-05T12:59:00Z".to_string(),
+        item,
+    });
+    std::fs::write(
+        &file_path,
+        lines
+            .into_iter()
+            .map(|line| serde_json::to_string(&line))
+            .collect::<Result<Vec<_>, _>>()?
+            .join("\n")
+            + "\n",
+    )?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn thread_merge_creates_new_thread_and_emits_started() -> Result<()> {
     let server = app_test_support::create_mock_responses_server_repeating_assistant("Done").await;
@@ -281,6 +313,187 @@ async fn thread_merge_rejects_non_descendants() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_merge_rejects_duplicate_source_ids() -> Result<()> {
+    let server = app_test_support::create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let base_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "base",
+        Some("mock_provider"),
+        None,
+    )?;
+    let child_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-01-00",
+        "2025-01-05T12:01:00Z",
+        "child",
+        Some("mock_provider"),
+        None,
+    )?;
+    set_fork_parent(
+        codex_home.path(),
+        "2025-01-05T12-01-00",
+        &child_id,
+        &base_id,
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_thread_merge_request(ThreadMergeParams {
+            base_thread_id: base_id,
+            merge_thread_ids: vec![child_id.clone(), child_id],
+            ..Default::default()
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert!(error.error.message.contains("duplicate merge thread id"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_merge_rejects_cyclic_descendants() -> Result<()> {
+    let server = app_test_support::create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let base_id = create_fake_rollout(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "base",
+        Some("mock_provider"),
+        None,
+    )?;
+    let cyclic_id = create_rollout_with_turns(
+        codex_home.path(),
+        "2025-01-05T12-01-00",
+        "2025-01-05T12:01:00Z",
+        Some(&base_id),
+        &[],
+    )?;
+    set_fork_parent(
+        codex_home.path(),
+        "2025-01-05T12-01-00",
+        &cyclic_id,
+        &cyclic_id,
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_thread_merge_request(ThreadMergeParams {
+            base_thread_id: base_id,
+            merge_thread_ids: vec![cyclic_id],
+            ..Default::default()
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert!(error.error.message.contains("is not a descendant"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_merge_grandchild_merge_normalizes_ancestor_order() -> Result<()> {
+    let server = app_test_support::create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let base_id = create_rollout_with_turns(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        None,
+        &[],
+    )?;
+    let child_id = create_rollout_with_turns(
+        codex_home.path(),
+        "2025-01-05T12-01-00",
+        "2025-01-05T12:01:00Z",
+        Some(&base_id),
+        &[("child user", "child answer")],
+    )?;
+    let grandchild_id = create_rollout_with_turns(
+        codex_home.path(),
+        "2025-01-05T12-02-00",
+        "2025-01-05T12:02:00Z",
+        Some(&child_id),
+        &[
+            ("child user", "child answer"),
+            ("grandchild user", "grandchild answer"),
+        ],
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_thread_merge_request(ThreadMergeParams {
+            base_thread_id: base_id.clone(),
+            merge_thread_ids: vec![grandchild_id, child_id],
+            ephemeral: true,
+            ..Default::default()
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let ThreadMergeResponse { thread, .. } = to_response::<ThreadMergeResponse>(response)?;
+
+    assert_ne!(thread.id, base_id);
+    assert_eq!(
+        thread.turns.len(),
+        2,
+        "expected child and grandchild suffix turns"
+    );
+
+    match &thread.turns[0].items[0] {
+        ThreadItem::UserMessage { content, .. } => {
+            assert_eq!(
+                content,
+                &vec![UserInput::Text {
+                    text: "child user".to_string(),
+                    text_elements: Vec::new(),
+                }]
+            );
+        }
+        other => panic!("expected first merged user message, got {other:?}"),
+    }
+    match &thread.turns[1].items[0] {
+        ThreadItem::UserMessage { content, .. } => {
+            assert_eq!(
+                content,
+                &vec![UserInput::Text {
+                    text: "grandchild user".to_string(),
+                    text_elements: Vec::new(),
+                }]
+            );
+        }
+        other => panic!("expected second merged user message, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_merge_ephemeral_returns_merged_preview_and_turns() -> Result<()> {
     let server = app_test_support::create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
@@ -353,6 +566,145 @@ async fn thread_merge_ephemeral_returns_merged_preview_and_turns() -> Result<()>
                 content,
                 &vec![UserInput::Text {
                     text: "branch b user".to_string(),
+                    text_elements: Vec::new(),
+                }]
+            );
+        }
+        other => panic!("expected second merged user message, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_merge_preserves_descendant_rollback_of_inherited_turn() -> Result<()> {
+    let server = app_test_support::create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let base_id = create_rollout_with_turns(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        None,
+        &[("base-1", "base-1 answer"), ("base-2", "base-2 answer")],
+    )?;
+    let branch_id = create_rollout_with_turns(
+        codex_home.path(),
+        "2025-01-05T12-01-00",
+        "2025-01-05T12:01:00Z",
+        Some(&base_id),
+        &[("base-1", "base-1 answer"), ("base-2", "base-2 answer")],
+    )?;
+    append_rollout_item(
+        codex_home.path(),
+        "2025-01-05T12-01-00",
+        &branch_id,
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        })),
+    )?;
+    append_rollout_item(
+        codex_home.path(),
+        "2025-01-05T12-01-00",
+        &branch_id,
+        RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "branch".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }),
+    )?;
+    append_rollout_item(
+        codex_home.path(),
+        "2025-01-05T12-01-00",
+        &branch_id,
+        RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "branch answer".to_string(),
+            }],
+            end_turn: None,
+            phase: None,
+        }),
+    )?;
+    append_rollout_item(
+        codex_home.path(),
+        "2025-01-05T12-01-00",
+        &branch_id,
+        RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "branch".to_string(),
+            images: Some(Vec::new()),
+            local_images: Vec::new(),
+            text_elements: Vec::new(),
+        })),
+    )?;
+    append_rollout_item(
+        codex_home.path(),
+        "2025-01-05T12-01-00",
+        &branch_id,
+        RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+            message: "branch answer".to_string(),
+            phase: None,
+        })),
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_thread_merge_request(ThreadMergeParams {
+            base_thread_id: base_id,
+            merge_thread_ids: vec![branch_id],
+            ..Default::default()
+        })
+        .await?;
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let ThreadMergeResponse { thread, .. } = to_response::<ThreadMergeResponse>(response)?;
+    let read_request_id = mcp
+        .send_thread_read_request(ThreadReadParams {
+            thread_id: thread.id.clone(),
+            include_turns: true,
+        })
+        .await?;
+    let read_response: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_request_id)),
+    )
+    .await??;
+    let ThreadReadResponse { thread } = to_response::<ThreadReadResponse>(read_response)?;
+
+    assert_eq!(
+        thread.turns.len(),
+        2,
+        "merged thread should expose the rolled-back final state"
+    );
+    match &thread.turns[0].items[0] {
+        ThreadItem::UserMessage { content, .. } => {
+            assert_eq!(
+                content,
+                &vec![UserInput::Text {
+                    text: "base-1".to_string(),
+                    text_elements: Vec::new(),
+                }]
+            );
+        }
+        other => panic!("expected first merged user message, got {other:?}"),
+    }
+    match &thread.turns[1].items[0] {
+        ThreadItem::UserMessage { content, .. } => {
+            assert_eq!(
+                content,
+                &vec![UserInput::Text {
+                    text: "branch".to_string(),
                     text_elements: Vec::new(),
                 }]
             );

@@ -2098,17 +2098,6 @@ impl Session {
                 // If persisting, persist all rollout items as-is (recorder filters)
                 if !rollout_items.is_empty() {
                     self.persist_rollout_items(&rollout_items).await;
-                    if rollout_items
-                        .iter()
-                        .any(|item| matches!(item, RolloutItem::MergeBoundary(_)))
-                    {
-                        self.persist_rollout_items(&[RolloutItem::MergeBoundary(
-                            codex_protocol::protocol::MergeBoundaryItem {
-                                source_thread_id: self.conversation_id,
-                            },
-                        )])
-                        .await;
-                    }
                 }
 
                 // Append the current session's initial context after the reconstructed history.

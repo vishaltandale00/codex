@@ -263,6 +263,7 @@ fn emit_project_config_warnings(app_event_tx: &AppEventSender, config: &Config) 
 async fn collect_merge_picker_items(
     config: &Config,
     base_thread_id: ThreadId,
+    excluded_thread_id: Option<ThreadId>,
 ) -> Result<Vec<MultiSelectItem>> {
     let mut cursor = None;
     let mut items = Vec::new();
@@ -284,7 +285,7 @@ async fn collect_merge_picker_items(
             let Some(thread_id) = thread.thread_id else {
                 continue;
             };
-            if thread_id == base_thread_id {
+            if thread_id == base_thread_id || Some(thread_id) == excluded_thread_id {
                 continue;
             }
             if !is_descendant_thread(config, base_thread_id, thread.path.as_path()).await {
@@ -2330,7 +2331,13 @@ impl App {
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::OpenMergePicker => {
-                match crate::resume_picker::run_resume_picker(tui, &self.config, false).await? {
+                match crate::resume_picker::run_resume_picker_all_providers(
+                    tui,
+                    &self.config,
+                    false,
+                )
+                .await?
+                {
                     SessionSelection::Resume(target_session) => {
                         let current_cwd = self.config.cwd.clone();
                         let merge_cwd = match crate::resolve_cwd_for_resume_or_fork(
@@ -2350,8 +2357,12 @@ impl App {
                                 return Ok(AppRunControl::Exit(ExitReason::UserRequested));
                             }
                         };
-                        match collect_merge_picker_items(&self.config, target_session.thread_id)
-                            .await
+                        match collect_merge_picker_items(
+                            &self.config,
+                            target_session.thread_id,
+                            self.chat_widget.thread_id(),
+                        )
+                        .await
                         {
                             Ok(items) if items.is_empty() => {
                                 self.chat_widget.add_error_message(format!(
@@ -4362,11 +4373,47 @@ mod tests {
         config.codex_home = codex_home.path().to_path_buf();
         config.model_provider_id = "primary-provider".to_string();
 
-        let items = collect_merge_picker_items(&config, base_thread_id).await?;
+        let items = collect_merge_picker_items(&config, base_thread_id, None).await?;
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, other_thread_id.to_string());
         assert_eq!(items[0].name, "cross provider descendant");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collect_merge_picker_items_excludes_active_thread() -> Result<()> {
+        let codex_home = tempdir()?;
+        let base_thread_id = ThreadId::new();
+        let active_thread_id = ThreadId::new();
+        write_merge_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-00-00",
+            base_thread_id,
+            None,
+            "base thread",
+            "primary-provider",
+        )?;
+        write_merge_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-01-00",
+            active_thread_id,
+            Some(base_thread_id),
+            "active descendant",
+            "primary-provider",
+        )?;
+
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        config.codex_home = codex_home.path().to_path_buf();
+        config.model_provider_id = "primary-provider".to_string();
+
+        let items =
+            collect_merge_picker_items(&config, base_thread_id, Some(active_thread_id)).await?;
+
+        assert!(items.is_empty());
         Ok(())
     }
 

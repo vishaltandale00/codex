@@ -90,6 +90,7 @@ struct PageLoadRequest {
     request_token: usize,
     search_token: Option<usize>,
     default_provider: String,
+    limit_to_default_provider: bool,
     sort_key: ThreadSortKey,
 }
 
@@ -117,14 +118,14 @@ enum BackgroundEvent {
 ///
 /// Filtering happens in two layers:
 /// 1. Provider and source filtering at the backend (only interactive CLI sessions
-///    for the current model provider).
+///    for the current model provider, unless the caller opts into all providers).
 /// 2. Working-directory filtering at the picker (unless `--all` is passed).
 pub async fn run_resume_picker(
     tui: &mut Tui,
     config: &Config,
     show_all: bool,
 ) -> Result<SessionSelection> {
-    run_session_picker(tui, config, show_all, SessionPickerAction::Resume).await
+    run_session_picker(tui, config, show_all, SessionPickerAction::Resume, true).await
 }
 
 pub async fn run_fork_picker(
@@ -132,7 +133,15 @@ pub async fn run_fork_picker(
     config: &Config,
     show_all: bool,
 ) -> Result<SessionSelection> {
-    run_session_picker(tui, config, show_all, SessionPickerAction::Fork).await
+    run_session_picker(tui, config, show_all, SessionPickerAction::Fork, true).await
+}
+
+pub async fn run_resume_picker_all_providers(
+    tui: &mut Tui,
+    config: &Config,
+    show_all: bool,
+) -> Result<SessionSelection> {
+    run_session_picker(tui, config, show_all, SessionPickerAction::Resume, false).await
 }
 
 async fn run_session_picker(
@@ -140,6 +149,7 @@ async fn run_session_picker(
     config: &Config,
     show_all: bool,
     action: SessionPickerAction,
+    limit_to_default_provider: bool,
 ) -> Result<SessionSelection> {
     let alt = AltScreenGuard::enter(tui);
     let (bg_tx, bg_rx) = mpsc::unbounded_channel();
@@ -158,14 +168,16 @@ async fn run_session_picker(
         let tx = loader_tx.clone();
         let config = config.clone();
         tokio::spawn(async move {
-            let provider_filter = vec![request.default_provider.clone()];
+            let provider_filter = request
+                .limit_to_default_provider
+                .then(|| vec![request.default_provider.clone()]);
             let page = RolloutRecorder::list_threads(
                 &config,
                 PAGE_SIZE,
                 request.cursor.as_ref(),
                 request.sort_key,
                 INTERACTIVE_SESSION_SOURCES,
-                Some(provider_filter.as_slice()),
+                provider_filter.as_deref(),
                 request.default_provider.as_str(),
                 None,
             )
@@ -183,6 +195,7 @@ async fn run_session_picker(
         alt.tui.frame_requester(),
         page_loader,
         default_provider.clone(),
+        limit_to_default_provider,
         show_all,
         filter_cwd,
         action,
@@ -269,6 +282,7 @@ struct PickerState {
     page_loader: PageLoader,
     view_rows: Option<usize>,
     default_provider: String,
+    limit_to_default_provider: bool,
     show_all: bool,
     filter_cwd: Option<PathBuf>,
     action: SessionPickerAction,
@@ -362,6 +376,7 @@ impl PickerState {
         requester: FrameRequester,
         page_loader: PageLoader,
         default_provider: String,
+        limit_to_default_provider: bool,
         show_all: bool,
         filter_cwd: Option<PathBuf>,
         action: SessionPickerAction,
@@ -387,6 +402,7 @@ impl PickerState {
             page_loader,
             view_rows: None,
             default_provider,
+            limit_to_default_provider,
             show_all,
             filter_cwd,
             action,
@@ -515,6 +531,7 @@ impl PickerState {
             request_token,
             search_token,
             default_provider: self.default_provider.clone(),
+            limit_to_default_provider: self.limit_to_default_provider,
             sort_key: self.sort_key,
         });
     }
@@ -785,6 +802,7 @@ impl PickerState {
             request_token,
             search_token,
             default_provider: self.default_provider.clone(),
+            limit_to_default_provider: self.limit_to_default_provider,
             sort_key: self.sort_key,
         });
     }
@@ -1569,6 +1587,7 @@ mod tests {
             loader,
             String::from("openai"),
             true,
+            true,
             None,
             SessionPickerAction::Resume,
         );
@@ -1646,6 +1665,7 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            true,
             true,
             None,
             SessionPickerAction::Resume,
@@ -1883,6 +1903,7 @@ mod tests {
             loader,
             String::from("openai"),
             true,
+            true,
             None,
             SessionPickerAction::Resume,
         );
@@ -1949,6 +1970,7 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            true,
             true,
             None,
             SessionPickerAction::Resume,
@@ -2018,6 +2040,7 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            true,
             true,
             None,
             SessionPickerAction::Resume,
@@ -2100,6 +2123,7 @@ mod tests {
             loader,
             String::from("openai"),
             true,
+            true,
             None,
             SessionPickerAction::Resume,
         );
@@ -2121,6 +2145,32 @@ mod tests {
         assert_eq!(guard[1].sort_key, ThreadSortKey::CreatedAt);
     }
 
+    #[test]
+    fn initial_load_can_disable_default_provider_filter() {
+        let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let request_sink = recorded_requests.clone();
+        let loader: PageLoader = Arc::new(move |req: PageLoadRequest| {
+            request_sink.lock().unwrap().push(req);
+        });
+
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            String::from("openai"),
+            false,
+            true,
+            None,
+            SessionPickerAction::Resume,
+        );
+
+        state.start_initial_load();
+
+        let guard = recorded_requests.lock().unwrap();
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].limit_to_default_provider, false);
+    }
+
     #[tokio::test]
     async fn page_navigation_uses_view_rows() {
         let loader: PageLoader = Arc::new(|_| {});
@@ -2129,6 +2179,7 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            true,
             true,
             None,
             SessionPickerAction::Resume,
@@ -2175,6 +2226,7 @@ mod tests {
             loader,
             String::from("openai"),
             true,
+            true,
             None,
             SessionPickerAction::Resume,
         );
@@ -2214,6 +2266,7 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            true,
             true,
             None,
             SessionPickerAction::Resume,
@@ -2259,6 +2312,7 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
+            true,
             true,
             None,
             SessionPickerAction::Resume,
