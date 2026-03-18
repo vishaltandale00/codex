@@ -34,7 +34,6 @@ use super::list::ThreadSortKey;
 use super::list::ThreadsPage;
 use super::list::get_threads;
 use super::list::get_threads_in_root;
-use super::list::get_threads_with_empty_threads;
 use super::list::parse_cursor;
 use super::list::parse_timestamp_uuid_from_filename;
 use super::metadata;
@@ -177,7 +176,6 @@ impl RolloutRecorder {
         allowed_sources: &[SessionSource],
         model_providers: Option<&[String]>,
         default_provider: &str,
-        include_empty_threads: bool,
         search_term: Option<&str>,
     ) -> std::io::Result<ThreadsPage> {
         Self::list_threads_with_db_fallback(
@@ -189,7 +187,6 @@ impl RolloutRecorder {
             model_providers,
             default_provider,
             /*archived*/ false,
-            include_empty_threads,
             search_term,
         )
         .await
@@ -216,7 +213,6 @@ impl RolloutRecorder {
             model_providers,
             default_provider,
             /*archived*/ true,
-            /*include_empty_threads*/ false,
             search_term,
         )
         .await
@@ -232,7 +228,6 @@ impl RolloutRecorder {
         model_providers: Option<&[String]>,
         default_provider: &str,
         archived: bool,
-        include_empty_threads: bool,
         search_term: Option<&str>,
     ) -> std::io::Result<ThreadsPage> {
         let codex_home = config.codex_home.as_path();
@@ -250,13 +245,12 @@ impl RolloutRecorder {
                     allowed_sources,
                     model_providers,
                     default_provider,
-                    include_empty_threads,
                     layout: ThreadListLayout::Flat,
                 },
             )
             .await?
         } else {
-            get_threads_with_empty_threads(
+            get_threads(
                 codex_home,
                 fs_page_size,
                 cursor,
@@ -264,7 +258,6 @@ impl RolloutRecorder {
                 allowed_sources,
                 model_providers,
                 default_provider,
-                include_empty_threads,
             )
             .await?
         };
@@ -296,7 +289,6 @@ impl RolloutRecorder {
             allowed_sources,
             model_providers,
             archived,
-            include_empty_threads,
             search_term,
         )
         .await
@@ -335,7 +327,6 @@ impl RolloutRecorder {
                     allowed_sources,
                     model_providers,
                     /*archived*/ false,
-                    /*include_empty_threads*/ false,
                     /*search_term*/ None,
                 )
                 .await

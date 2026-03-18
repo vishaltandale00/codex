@@ -129,7 +129,6 @@ async fn load_recent_threads(sess: &Session) -> Vec<ThreadMetadata> {
             &[],
             /*model_providers*/ None,
             /*archived_only*/ false,
-            /*include_empty_threads*/ false,
             /*search_term*/ None,
         )
         .await

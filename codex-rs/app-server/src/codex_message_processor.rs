@@ -4227,7 +4227,6 @@ impl CodexMessageProcessor {
                     allowed_sources,
                     model_provider_filter.as_deref(),
                     fallback_provider.as_str(),
-                    false,
                     search_term.as_deref(),
                 )
                 .await

@@ -198,7 +198,6 @@ LEFT JOIN jobs
         push_thread_filters(
             &mut builder,
             /*archived_only*/ false,
-            /*include_empty_threads*/ false,
             allowed_sources,
             /*model_providers*/ None,
             /*anchor*/ None,

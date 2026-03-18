@@ -738,7 +738,6 @@ async fn run_ratatui_app(
                 INTERACTIVE_SESSION_SOURCES,
                 Some(provider_filter.as_slice()),
                 &config.model_provider_id,
-                /*include_empty_threads*/ false,
                 /*search_term*/ None,
             )
             .await

@@ -85,10 +85,6 @@ impl SessionPickerAction {
         }
     }
 
-    fn include_empty_threads(self) -> bool {
-        matches!(self, SessionPickerAction::Combine)
-    }
-
     fn esc_selection(self) -> SessionSelection {
         match self {
             SessionPickerAction::Resume | SessionPickerAction::Fork => SessionSelection::StartFresh,
@@ -186,11 +182,9 @@ async fn run_session_picker(
 
     let config = config.clone();
     let loader_tx = bg_tx.clone();
-    let action_for_loader = action;
     let page_loader: PageLoader = Arc::new(move |request: PageLoadRequest| {
         let tx = loader_tx.clone();
         let config = config.clone();
-        let action = action_for_loader;
         tokio::spawn(async move {
             let provider_filter = vec![request.default_provider.clone()];
             let page = RolloutRecorder::list_threads(
@@ -201,7 +195,6 @@ async fn run_session_picker(
                 INTERACTIVE_SESSION_SOURCES,
                 Some(&provider_filter),
                 request.default_provider.as_str(),
-                action.include_empty_threads(),
                 /*search_term*/ None,
             )
             .await;
@@ -1541,13 +1534,6 @@ mod tests {
         };
         let row = head_to_row(&item);
         assert_eq!(row.preview, "(no message yet)");
-    }
-
-    #[test]
-    fn combine_picker_requests_empty_threads_but_resume_picker_does_not() {
-        assert_eq!(SessionPickerAction::Resume.include_empty_threads(), false);
-        assert_eq!(SessionPickerAction::Fork.include_empty_threads(), false);
-        assert_eq!(SessionPickerAction::Combine.include_empty_threads(), true);
     }
 
     #[tokio::test]

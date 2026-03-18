@@ -93,7 +93,6 @@ async fn has_recorded_sessions(codex_home: &Path, default_provider: &str) -> io:
             allowed_sources,
             model_providers: None,
             default_provider,
-            include_empty_threads: false,
             layout: ThreadListLayout::NestedByDate,
         },
     )
@@ -111,7 +110,6 @@ async fn has_recorded_sessions(codex_home: &Path, default_provider: &str) -> io:
             allowed_sources,
             model_providers: None,
             default_provider,
-            include_empty_threads: false,
             layout: ThreadListLayout::Flat,
         },
     )

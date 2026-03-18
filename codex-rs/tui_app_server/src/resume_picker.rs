@@ -325,7 +325,6 @@ fn spawn_rollout_page_loader(
                 INTERACTIVE_SESSION_SOURCES,
                 default_provider.as_ref().map(std::slice::from_ref),
                 default_provider.as_deref().unwrap_or_default(),
-                /*include_empty_threads*/ false,
                 /*search_term*/ None,
             )
             .await

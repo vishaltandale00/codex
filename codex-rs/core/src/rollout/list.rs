@@ -120,7 +120,6 @@ pub(crate) struct ThreadListConfig<'a> {
     pub(crate) allowed_sources: &'a [SessionSource],
     pub(crate) model_providers: Option<&'a [String]>,
     pub(crate) default_provider: &'a str,
-    pub(crate) include_empty_threads: bool,
     pub(crate) layout: ThreadListLayout,
 }
 
@@ -201,7 +200,6 @@ struct FilesByCreatedAtVisitor<'a> {
     more_matches_available: bool,
     allowed_sources: &'a [SessionSource],
     provider_matcher: Option<&'a ProviderMatcher<'a>>,
-    include_empty_threads: bool,
 }
 
 #[async_trait]
@@ -232,7 +230,6 @@ impl<'a> RolloutFileVisitor for FilesByCreatedAtVisitor<'a> {
             path,
             self.allowed_sources,
             self.provider_matcher,
-            self.include_empty_threads,
             updated_at,
         )
         .await
@@ -312,30 +309,6 @@ pub(crate) async fn get_threads(
     model_providers: Option<&[String]>,
     default_provider: &str,
 ) -> io::Result<ThreadsPage> {
-    get_threads_with_empty_threads(
-        codex_home,
-        page_size,
-        cursor,
-        sort_key,
-        allowed_sources,
-        model_providers,
-        default_provider,
-        false,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn get_threads_with_empty_threads(
-    codex_home: &Path,
-    page_size: usize,
-    cursor: Option<&Cursor>,
-    sort_key: ThreadSortKey,
-    allowed_sources: &[SessionSource],
-    model_providers: Option<&[String]>,
-    default_provider: &str,
-    include_empty_threads: bool,
-) -> io::Result<ThreadsPage> {
     let root = codex_home.join(SESSIONS_SUBDIR);
     get_threads_in_root(
         root,
@@ -346,7 +319,6 @@ pub(crate) async fn get_threads_with_empty_threads(
             allowed_sources,
             model_providers,
             default_provider,
-            include_empty_threads,
             layout: ThreadListLayout::NestedByDate,
         },
     )
@@ -384,7 +356,6 @@ pub(crate) async fn get_threads_in_root(
                 sort_key,
                 config.allowed_sources,
                 provider_matcher.as_ref(),
-                config.include_empty_threads,
             )
             .await?
         }
@@ -396,7 +367,6 @@ pub(crate) async fn get_threads_in_root(
                 sort_key,
                 config.allowed_sources,
                 provider_matcher.as_ref(),
-                config.include_empty_threads,
             )
             .await?
         }
@@ -415,7 +385,6 @@ async fn traverse_directories_for_paths(
     sort_key: ThreadSortKey,
     allowed_sources: &[SessionSource],
     provider_matcher: Option<&ProviderMatcher<'_>>,
-    include_empty_threads: bool,
 ) -> io::Result<ThreadsPage> {
     match sort_key {
         ThreadSortKey::CreatedAt => {
@@ -425,7 +394,6 @@ async fn traverse_directories_for_paths(
                 anchor,
                 allowed_sources,
                 provider_matcher,
-                include_empty_threads,
             )
             .await
         }
@@ -436,7 +404,6 @@ async fn traverse_directories_for_paths(
                 anchor,
                 allowed_sources,
                 provider_matcher,
-                include_empty_threads,
             )
             .await
         }
@@ -450,30 +417,15 @@ async fn traverse_flat_paths(
     sort_key: ThreadSortKey,
     allowed_sources: &[SessionSource],
     provider_matcher: Option<&ProviderMatcher<'_>>,
-    include_empty_threads: bool,
 ) -> io::Result<ThreadsPage> {
     match sort_key {
         ThreadSortKey::CreatedAt => {
-            traverse_flat_paths_created(
-                root,
-                page_size,
-                anchor,
-                allowed_sources,
-                provider_matcher,
-                include_empty_threads,
-            )
-            .await
+            traverse_flat_paths_created(root, page_size, anchor, allowed_sources, provider_matcher)
+                .await
         }
         ThreadSortKey::UpdatedAt => {
-            traverse_flat_paths_updated(
-                root,
-                page_size,
-                anchor,
-                allowed_sources,
-                provider_matcher,
-                include_empty_threads,
-            )
-            .await
+            traverse_flat_paths_updated(root, page_size, anchor, allowed_sources, provider_matcher)
+                .await
         }
     }
 }
@@ -490,7 +442,6 @@ async fn traverse_directories_for_paths_created(
     anchor: Option<Cursor>,
     allowed_sources: &[SessionSource],
     provider_matcher: Option<&ProviderMatcher<'_>>,
-    include_empty_threads: bool,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -502,7 +453,6 @@ async fn traverse_directories_for_paths_created(
         more_matches_available,
         allowed_sources,
         provider_matcher,
-        include_empty_threads,
     };
     walk_rollout_files(&root, &mut scanned_files, &mut visitor).await?;
     more_matches_available = visitor.more_matches_available;
@@ -539,7 +489,6 @@ async fn traverse_directories_for_paths_updated(
     anchor: Option<Cursor>,
     allowed_sources: &[SessionSource],
     provider_matcher: Option<&ProviderMatcher<'_>>,
-    include_empty_threads: bool,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -568,7 +517,6 @@ async fn traverse_directories_for_paths_updated(
             candidate.path,
             allowed_sources,
             provider_matcher,
-            include_empty_threads,
             updated_at_fallback,
         )
         .await
@@ -601,7 +549,6 @@ async fn traverse_flat_paths_created(
     anchor: Option<Cursor>,
     allowed_sources: &[SessionSource],
     provider_matcher: Option<&ProviderMatcher<'_>>,
-    include_empty_threads: bool,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -621,14 +568,8 @@ async fn traverse_flat_paths_created(
             .await
             .unwrap_or(None)
             .and_then(format_rfc3339);
-        if let Some(item) = build_thread_item(
-            path,
-            allowed_sources,
-            provider_matcher,
-            include_empty_threads,
-            updated_at,
-        )
-        .await
+        if let Some(item) =
+            build_thread_item(path, allowed_sources, provider_matcher, updated_at).await
         {
             items.push(item);
         }
@@ -658,7 +599,6 @@ async fn traverse_flat_paths_updated(
     anchor: Option<Cursor>,
     allowed_sources: &[SessionSource],
     provider_matcher: Option<&ProviderMatcher<'_>>,
-    include_empty_threads: bool,
 ) -> io::Result<ThreadsPage> {
     let mut items: Vec<ThreadItem> = Vec::with_capacity(page_size);
     let mut scanned_files = 0usize;
@@ -687,7 +627,6 @@ async fn traverse_flat_paths_updated(
             candidate.path,
             allowed_sources,
             provider_matcher,
-            include_empty_threads,
             updated_at_fallback,
         )
         .await
@@ -753,7 +692,6 @@ async fn build_thread_item(
     path: PathBuf,
     allowed_sources: &[SessionSource],
     provider_matcher: Option<&ProviderMatcher<'_>>,
-    include_empty_threads: bool,
     updated_at: Option<String>,
 ) -> Option<ThreadItem> {
     // Read head and detect message events; stop once meta + user are found.
@@ -774,7 +712,7 @@ async fn build_thread_item(
         return None;
     }
     // Apply filters: must have session meta and at least one user message event
-    if summary.saw_session_meta && (include_empty_threads || summary.saw_user_event) {
+    if summary.saw_session_meta && summary.saw_user_event {
         let HeadTailSummary {
             thread_id,
             first_user_message,

@@ -305,7 +305,6 @@ async fn collect_combine_picker_items(
             INTERACTIVE_SESSION_SOURCES,
             Some(&model_providers),
             config.model_provider_id.as_str(),
-            true,
             None,
         )
         .await?;
@@ -5012,50 +5011,6 @@ mod tests {
         assert!(ids.contains(&same_cwd_thread_id));
         assert!(!ids.contains(&sibling_cwd_thread_id));
         assert!(!ids.contains(&other_repo_thread_id));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn collect_combine_picker_items_includes_zero_turn_threads() -> Result<()> {
-        let codex_home = tempdir()?;
-        let workspace_cwd = codex_home.path().join("workspace");
-        std::fs::create_dir_all(&workspace_cwd)?;
-        let base_thread_id = ThreadId::new();
-        let empty_thread_id = ThreadId::new();
-
-        write_combine_picker_rollout(
-            codex_home.path(),
-            "2026-01-01T00-00-00",
-            base_thread_id,
-            None,
-            workspace_cwd.as_path(),
-            "base thread",
-            "primary-provider",
-        )?;
-        write_empty_combine_picker_rollout(
-            codex_home.path(),
-            "2026-01-01T00-01-00",
-            empty_thread_id,
-            None,
-            workspace_cwd.as_path(),
-            "primary-provider",
-        )?;
-
-        let mut config = ConfigBuilder::default()
-            .codex_home(codex_home.path().to_path_buf())
-            .build()
-            .await?;
-        config.codex_home = codex_home.path().to_path_buf();
-        config.model_provider_id = "primary-provider".to_string();
-
-        let items =
-            collect_combine_picker_items(&config, base_thread_id, workspace_cwd, None).await?;
-        let empty_thread = items
-            .into_iter()
-            .find(|item| item.thread_id == empty_thread_id)
-            .expect("empty thread should be included");
-
-        assert_eq!(empty_thread.display_name, "(No turns yet)");
         Ok(())
     }
 

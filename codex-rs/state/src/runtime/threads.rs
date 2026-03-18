@@ -112,7 +112,6 @@ ORDER BY position ASC
         allowed_sources: &[String],
         model_providers: Option<&[String]>,
         archived_only: bool,
-        include_empty_threads: bool,
         search_term: Option<&str>,
     ) -> anyhow::Result<crate::ThreadsPage> {
         let limit = page_size.saturating_add(1);
@@ -147,7 +146,6 @@ FROM threads
         push_thread_filters(
             &mut builder,
             archived_only,
-            include_empty_threads,
             allowed_sources,
             model_providers,
             anchor,
@@ -191,7 +189,6 @@ FROM threads
         push_thread_filters(
             &mut builder,
             archived_only,
-            false,
             allowed_sources,
             model_providers,
             anchor,
@@ -611,7 +608,6 @@ pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
 pub(super) fn push_thread_filters<'a>(
     builder: &mut QueryBuilder<'a, Sqlite>,
     archived_only: bool,
-    include_empty_threads: bool,
     allowed_sources: &'a [String],
     model_providers: Option<&'a [String]>,
     anchor: Option<&crate::Anchor>,
@@ -624,9 +620,7 @@ pub(super) fn push_thread_filters<'a>(
     } else {
         builder.push(" AND archived = 0");
     }
-    if !include_empty_threads {
-        builder.push(" AND first_user_message <> ''");
-    }
+    builder.push(" AND first_user_message <> ''");
     if !allowed_sources.is_empty() {
         builder.push(" AND source IN (");
         let mut separated = builder.separated(", ");
@@ -763,48 +757,12 @@ mod tests {
             .expect("hidden thread insert should succeed");
 
         let page = runtime
-            .list_threads(10, None, SortKey::UpdatedAt, &[], None, false, false, None)
+            .list_threads(10, None, SortKey::UpdatedAt, &[], None, false, None)
             .await
             .expect("list_threads should succeed");
 
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].id, visible_thread_id);
-    }
-
-    #[tokio::test]
-    async fn list_threads_includes_zero_turn_threads_when_requested() {
-        let codex_home = unique_temp_dir();
-        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-            .await
-            .expect("state db should initialize");
-        let visible_thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000126").expect("valid thread id");
-        let empty_thread_id =
-            ThreadId::from_string("00000000-0000-0000-0000-000000000127").expect("valid thread id");
-
-        let mut visible = test_thread_metadata(&codex_home, visible_thread_id, codex_home.clone());
-        visible.first_user_message = Some("real question".to_string());
-        let mut empty = test_thread_metadata(&codex_home, empty_thread_id, codex_home.clone());
-        empty.first_user_message = None;
-
-        runtime
-            .upsert_thread(&visible)
-            .await
-            .expect("visible thread insert should succeed");
-        runtime
-            .upsert_thread(&empty)
-            .await
-            .expect("empty thread insert should succeed");
-
-        let page = runtime
-            .list_threads(10, None, SortKey::UpdatedAt, &[], None, false, true, None)
-            .await
-            .expect("list_threads should succeed");
-        let ids: Vec<ThreadId> = page.items.into_iter().map(|item| item.id).collect();
-
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&visible_thread_id));
-        assert!(ids.contains(&empty_thread_id));
     }
 
     #[tokio::test]
