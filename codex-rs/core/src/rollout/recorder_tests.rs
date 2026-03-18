@@ -303,6 +303,7 @@ async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Re
         &[],
         None,
         default_provider.as_str(),
+        false,
         None,
     )
     .await?;
@@ -318,6 +319,7 @@ async fn list_threads_db_disabled_does_not_skip_paginated_items() -> std::io::Re
         &[],
         None,
         default_provider.as_str(),
+        false,
         None,
     )
     .await?;
@@ -382,6 +384,7 @@ async fn list_threads_db_enabled_drops_missing_rollout_paths() -> std::io::Resul
         &[],
         None,
         default_provider.as_str(),
+        false,
         None,
     )
     .await?;
@@ -451,6 +454,7 @@ async fn list_threads_db_enabled_repairs_stale_rollout_paths() -> std::io::Resul
         &[],
         None,
         default_provider.as_str(),
+        false,
         None,
     )
     .await?;

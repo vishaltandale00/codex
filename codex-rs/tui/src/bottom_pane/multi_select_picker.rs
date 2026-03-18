@@ -149,6 +149,9 @@ pub(crate) struct MultiSelectPicker {
     /// Cached preview line (updated on item changes).
     preview_line: Option<Line<'static>>,
 
+    /// Optional validation message shown when confirmation requires at least one selection.
+    require_selection_message: Option<Line<'static>>,
+
     /// Callback invoked when items change (toggle or reorder).
     on_change: Option<ChangeCallBack>,
 
@@ -314,15 +317,22 @@ impl MultiSelectPicker {
         if self.complete {
             return;
         }
-        self.complete = true;
 
+        let selected_ids: Vec<String> = self
+            .items
+            .iter()
+            .filter(|item| item.enabled)
+            .map(|item| item.id.clone())
+            .collect();
+        if selected_ids.is_empty()
+            && let Some(message) = &self.require_selection_message
+        {
+            self.preview_line = Some(message.clone());
+            return;
+        }
+
+        self.complete = true;
         if let Some(on_confirm) = &self.on_confirm {
-            let selected_ids: Vec<String> = self
-                .items
-                .iter()
-                .filter(|item| item.enabled)
-                .map(|item| item.id.clone())
-                .collect();
             on_confirm(&selected_ids, &self.app_event_tx);
         }
     }
@@ -628,6 +638,7 @@ pub(crate) struct MultiSelectPickerBuilder {
     on_change: Option<ChangeCallBack>,
     on_confirm: Option<ConfirmCallback>,
     on_cancel: Option<CancelCallback>,
+    require_selection_message: Option<Line<'static>>,
 }
 
 impl MultiSelectPickerBuilder {
@@ -644,6 +655,7 @@ impl MultiSelectPickerBuilder {
             on_change: None,
             on_confirm: None,
             on_cancel: None,
+            require_selection_message: None,
         }
     }
 
@@ -714,6 +726,12 @@ impl MultiSelectPickerBuilder {
         self
     }
 
+    /// Requires at least one selected item before Enter will confirm.
+    pub fn require_selection(mut self, message: String) -> Self {
+        self.require_selection_message = Some(Line::from(message));
+        self
+    }
+
     /// Builds the [`MultiSelectPicker`] with all configured options.
     ///
     /// Initializes the filter to show all items and generates the initial
@@ -752,6 +770,7 @@ impl MultiSelectPickerBuilder {
             filtered_indices: Vec::new(),
             preview_builder: self.preview_builder,
             preview_line: None,
+            require_selection_message: self.require_selection_message,
             on_change: self.on_change,
             on_confirm: self.on_confirm,
             on_cancel: self.on_cancel,
@@ -792,4 +811,65 @@ pub(crate) fn match_item(
         return Some((None, score));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_event::AppEvent;
+    use crate::app_event_sender::AppEventSender;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    fn picker_with_require_selection() -> (
+        MultiSelectPicker,
+        tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    ) {
+        let (tx, rx) = unbounded_channel();
+        let app_event_tx = AppEventSender::new(tx);
+        let picker = MultiSelectPicker::builder("Test".to_string(), None, app_event_tx)
+            .items(vec![
+                MultiSelectItem {
+                    id: "one".to_string(),
+                    name: "One".to_string(),
+                    description: None,
+                    enabled: false,
+                },
+                MultiSelectItem {
+                    id: "two".to_string(),
+                    name: "Two".to_string(),
+                    description: None,
+                    enabled: false,
+                },
+            ])
+            .require_selection("Pick one first".to_string())
+            .on_confirm(|_, tx| tx.send(AppEvent::NewSession))
+            .build();
+        (picker, rx)
+    }
+
+    #[test]
+    fn enter_with_zero_selected_keeps_picker_open_when_selection_required() {
+        let (mut picker, _rx) = picker_with_require_selection();
+        picker.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+        assert!(!picker.complete);
+    }
+
+    #[test]
+    fn enter_with_zero_selected_shows_validation_message() {
+        let (mut picker, _rx) = picker_with_require_selection();
+        picker.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+        assert_eq!(picker.preview_line, Some(Line::from("Pick one first")));
+    }
+
+    #[test]
+    fn enter_with_selection_confirms_and_closes() {
+        let (mut picker, mut rx) = picker_with_require_selection();
+        picker.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
+        picker.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+        assert!(picker.complete);
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::NewSession)));
+    }
 }

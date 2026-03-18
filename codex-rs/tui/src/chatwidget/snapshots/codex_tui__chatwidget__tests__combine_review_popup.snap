@@ -1,0 +1,19 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: popup
+---
+  Review Combination
+  The base thread stays first; selected threads are appended after it.
+  Confirm the selected threads in order.
+  Order affects the result.
+  Threads appended after base: 2
+  1. First thread
+     first description
+  2. Second thread
+     second description
+
+› 1. Combine now  Create a new thread by appending the selected threads after the base
+                  thread.
+  2. Cancel       Return to the chat without combining threads.
+
+  Press enter to confirm or esc to go back

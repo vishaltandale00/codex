@@ -23,8 +23,8 @@ use crate::rollout::RolloutRecorder;
 use crate::rollout::truncation;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillsManager;
-use crate::thread_merge::MergeSource;
-use crate::thread_merge::build_merged_rollout;
+use crate::thread_combine::CombineSource;
+use crate::thread_combine::build_combined_rollout;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelPreset;
@@ -499,20 +499,20 @@ impl ThreadManager {
         .await
     }
 
-    pub async fn merge_threads(
+    pub async fn combine_threads(
         &self,
         base_thread_id: ThreadId,
         config: Config,
         base_path: PathBuf,
-        merge_sources: Vec<(ThreadId, PathBuf)>,
+        combine_sources: Vec<(ThreadId, PathBuf)>,
         parent_trace: Option<W3cTraceContext>,
     ) -> CodexResult<NewThread> {
-        let merge_sources: Vec<MergeSource> = merge_sources
+        let combine_sources: Vec<CombineSource> = combine_sources
             .into_iter()
-            .map(|(thread_id, path)| MergeSource { thread_id, path })
+            .map(|(thread_id, path)| CombineSource { thread_id, path })
             .collect();
         let history =
-            build_merged_rollout(base_thread_id, base_path.as_path(), &merge_sources).await?;
+            build_combined_rollout(base_thread_id, base_path.as_path(), &combine_sources).await?;
         Box::pin(self.state.spawn_thread(
             config,
             InitialHistory::Forked(history),
@@ -525,7 +525,6 @@ impl ThreadManager {
         ))
         .await
     }
-
     pub(crate) fn agent_control(&self) -> AgentControl {
         AgentControl::new(Arc::downgrade(&self.state))
     }

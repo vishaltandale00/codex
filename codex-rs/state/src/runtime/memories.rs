@@ -194,6 +194,7 @@ LEFT JOIN jobs
         push_thread_filters(
             &mut builder,
             false,
+            false,
             allowed_sources,
             None,
             None,

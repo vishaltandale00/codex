@@ -1,0 +1,13 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: popup
+---
+  Choose threads to combine
+  Select threads to combine in order.
+
+  Type to search
+  >
+› [ ] First thread   first description
+  [ ] Second thread  second description
+
+  Press space to toggle; ←/→ to reorder; enter to review selected; esc to cancel

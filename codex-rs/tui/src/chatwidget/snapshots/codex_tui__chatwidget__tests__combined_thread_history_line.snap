@@ -1,0 +1,5 @@
+---
+source: tui/src/chatwidget/tests.rs
+expression: combined
+---
+• Thread combined from playwright test frontend and checkout smoke follow-up

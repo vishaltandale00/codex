@@ -204,6 +204,7 @@ pub async fn list_threads_db(
     allowed_sources: &[SessionSource],
     model_providers: Option<&[String]>,
     archived: bool,
+    include_empty_threads: bool,
     search_term: Option<&str>,
 ) -> Option<codex_state::ThreadsPage> {
     let ctx = context?;
@@ -236,6 +237,7 @@ pub async fn list_threads_db(
             allowed_sources.as_slice(),
             model_providers.as_deref(),
             archived,
+            include_empty_threads,
             search_term,
         )
         .await

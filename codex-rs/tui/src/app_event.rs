@@ -65,6 +65,14 @@ pub(crate) struct ConnectorsSnapshot {
     pub(crate) connectors: Vec<AppInfo>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CombineCandidateThread {
+    pub(crate) path: PathBuf,
+    pub(crate) thread_id: ThreadId,
+    pub(crate) display_name: String,
+    pub(crate) description: Option<String>,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AppEvent {
@@ -96,17 +104,39 @@ pub(crate) enum AppEvent {
     /// Open the resume picker inside the running TUI session.
     OpenResumePicker,
 
-    /// Open the merge picker flow inside the running TUI session.
-    OpenMergePicker,
+    /// Open the combine picker flow inside the running TUI session.
+    OpenCombinePicker,
+
+    /// Review the ordered thread list before combining histories.
+    OpenCombineReview {
+        base_thread_id: ThreadId,
+        base_path: PathBuf,
+        combine_threads: Vec<CombineCandidateThread>,
+        cwd: PathBuf,
+    },
+
+    /// Finalize asynchronous candidate collection for the combine picker.
+    CombinePickerLoaded {
+        request_id: u64,
+        base_thread_id: ThreadId,
+        base_path: PathBuf,
+        cwd: PathBuf,
+        result: Result<Vec<CombineCandidateThread>, String>,
+    },
+
+    /// Cancel a pending async combine-picker load before the candidate list arrives.
+    CancelCombinePickerLoad {
+        request_id: u64,
+    },
 
     /// Fork the current session into a new thread.
     ForkCurrentSession,
 
-    /// Merge descendant threads into a new thread forked from the selected base session.
-    MergeThreads {
+    /// Combine selected threads into a new thread using the selected base thread as the first segment.
+    CombineThreads {
         base_thread_id: ThreadId,
         base_path: PathBuf,
-        merge_thread_ids: Vec<ThreadId>,
+        combine_thread_ids: Vec<ThreadId>,
         cwd: PathBuf,
     },
 

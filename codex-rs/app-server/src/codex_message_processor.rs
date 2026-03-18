@@ -185,8 +185,8 @@ use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::CodexThread;
+use codex_core::CombineSource;
 use codex_core::Cursor as RolloutCursor;
-use codex_core::MergeSource;
 use codex_core::NewThread;
 use codex_core::RolloutRecorder;
 use codex_core::SessionMeta;
@@ -198,7 +198,7 @@ use codex_core::auth::AuthMode as CoreAuthMode;
 use codex_core::auth::CLIENT_ID;
 use codex_core::auth::login_with_api_key;
 use codex_core::auth::login_with_chatgpt_auth_tokens;
-use codex_core::build_merged_rollout;
+use codex_core::build_combined_rollout;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::NetworkProxyAuditMetadata;
@@ -228,6 +228,7 @@ use codex_core::mcp::collect_mcp_snapshot;
 use codex_core::mcp::group_tools_by_server;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_core::parse_cursor;
+use codex_core::paths_share_workspace;
 use codex_core::plugins::MarketplaceError;
 use codex_core::plugins::MarketplacePluginSourceSummary;
 use codex_core::plugins::PluginInstallError as CorePluginInstallError;
@@ -236,7 +237,7 @@ use codex_core::plugins::PluginReadRequest;
 use codex_core::plugins::PluginUninstallError as CorePluginUninstallError;
 use codex_core::plugins::load_plugin_apps;
 use codex_core::read_head_for_summary;
-use codex_core::read_session_meta_line;
+use codex_core::resolve_recorded_thread_cwd;
 use codex_core::rollout_date_parts;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_core::skills::remote::export_remote_skill;
@@ -671,7 +672,7 @@ impl CodexMessageProcessor {
                     .await;
             }
             ClientRequest::ThreadMerge { request_id, params } => {
-                self.thread_merge(to_connection_request_id(request_id), params)
+                self.thread_combine(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::ThreadArchive { request_id, params } => {
@@ -3845,7 +3846,7 @@ impl CodexMessageProcessor {
         };
 
         let history_cwd =
-            read_history_cwd_from_state_db(&self.config, source_thread_id, rollout_path.as_path())
+            resolve_recorded_thread_cwd(&self.config, source_thread_id, rollout_path.as_path())
                 .await;
 
         // Persist Windows sandbox mode.
@@ -4056,10 +4057,10 @@ impl CodexMessageProcessor {
             .await;
     }
 
-    async fn thread_merge(&mut self, request_id: ConnectionRequestId, params: ThreadMergeParams) {
+    async fn thread_combine(&mut self, request_id: ConnectionRequestId, params: ThreadMergeParams) {
         let ThreadMergeParams {
             base_thread_id,
-            merge_thread_ids,
+            merge_thread_ids: combine_thread_ids,
             model,
             model_provider,
             service_tier,
@@ -4072,7 +4073,7 @@ impl CodexMessageProcessor {
             ephemeral,
         } = params;
 
-        if merge_thread_ids.is_empty() {
+        if combine_thread_ids.is_empty() {
             self.send_invalid_request_error(
                 request_id,
                 "mergeThreadIds must not be empty".to_string(),
@@ -4116,21 +4117,21 @@ impl CodexMessageProcessor {
                 }
             };
 
-        let mut seen_merge_ids = std::collections::HashSet::new();
-        let mut merge_sources = Vec::new();
-        for merge_thread_id in merge_thread_ids {
-            let merge_thread_uuid = match ThreadId::from_string(&merge_thread_id) {
+        let mut seen_combine_ids = std::collections::HashSet::new();
+        let mut combine_sources = Vec::new();
+        for combine_thread_id in combine_thread_ids {
+            let combine_thread_uuid = match ThreadId::from_string(&combine_thread_id) {
                 Ok(id) => id,
                 Err(err) => {
                     self.send_invalid_request_error(
                         request_id,
-                        format!("invalid merge thread id `{merge_thread_id}`: {err}"),
+                        format!("invalid source thread id `{combine_thread_id}`: {err}"),
                     )
                     .await;
                     return;
                 }
             };
-            if merge_thread_uuid == base_thread_id {
+            if combine_thread_uuid == base_thread_id {
                 self.send_invalid_request_error(
                     request_id,
                     "baseThreadId cannot appear in mergeThreadIds".to_string(),
@@ -4138,17 +4139,17 @@ impl CodexMessageProcessor {
                 .await;
                 return;
             }
-            if !seen_merge_ids.insert(merge_thread_uuid) {
+            if !seen_combine_ids.insert(combine_thread_uuid) {
                 self.send_invalid_request_error(
                     request_id,
-                    format!("duplicate merge thread id {merge_thread_uuid}"),
+                    format!("duplicate source thread id {combine_thread_uuid}"),
                 )
                 .await;
                 return;
             }
-            let merge_path = match find_thread_path_by_id_str(
+            let combine_path = match find_thread_path_by_id_str(
                 &self.config.codex_home,
-                &merge_thread_uuid.to_string(),
+                &combine_thread_uuid.to_string(),
             )
             .await
             {
@@ -4156,7 +4157,7 @@ impl CodexMessageProcessor {
                 Ok(None) => {
                     self.send_invalid_request_error(
                         request_id,
-                        format!("no rollout found for thread id {merge_thread_uuid}"),
+                        format!("no rollout found for thread id {combine_thread_uuid}"),
                     )
                     .await;
                     return;
@@ -4164,35 +4165,76 @@ impl CodexMessageProcessor {
                 Err(err) => {
                     self.send_invalid_request_error(
                         request_id,
-                        format!("failed to locate thread id {merge_thread_uuid}: {err}"),
+                        format!("failed to locate thread id {combine_thread_uuid}: {err}"),
                     )
                     .await;
                     return;
                 }
             };
-            if !is_descendant_thread(
-                &self.config.codex_home,
-                base_thread_id,
-                merge_path.as_path(),
+            combine_sources.push(CombineSource {
+                thread_id: combine_thread_uuid,
+                path: combine_path,
+            });
+        }
+
+        let Some(base_cwd) =
+            resolve_recorded_thread_cwd(&self.config, Some(base_thread_id), base_path.as_path())
+                .await
+        else {
+            self.send_invalid_request_error(
+                request_id,
+                format!("failed to determine workspace cwd for base thread {base_thread_id}"),
+            )
+            .await;
+            return;
+        };
+
+        for source in &combine_sources {
+            let Some(source_cwd) = resolve_recorded_thread_cwd(
+                &self.config,
+                Some(source.thread_id),
+                source.path.as_path(),
             )
             .await
-            {
+            else {
                 self.send_invalid_request_error(
                     request_id,
-                    format!("thread {merge_thread_uuid} is not a descendant of {base_thread_id}"),
+                    format!(
+                        "failed to determine workspace cwd for source thread {}",
+                        source.thread_id
+                    ),
+                )
+                .await;
+                return;
+            };
+
+            if !paths_share_workspace(base_cwd.as_path(), source_cwd.as_path()) {
+                self.send_invalid_request_error(
+                    request_id,
+                    format!(
+                        "thread {} is not in the same workspace as base thread {base_thread_id}",
+                        source.thread_id
+                    ),
                 )
                 .await;
                 return;
             }
-            merge_sources.push(MergeSource {
-                thread_id: merge_thread_uuid,
-                path: merge_path,
-            });
         }
 
-        let history_cwd =
-            read_history_cwd_from_state_db(&self.config, Some(base_thread_id), base_path.as_path())
-                .await;
+        if let Some(request_cwd) = cwd.as_ref()
+            && !paths_share_workspace(base_cwd.as_path(), Path::new(request_cwd))
+        {
+            self.send_invalid_request_error(
+                request_id,
+                format!(
+                    "requested cwd {request_cwd} is not in the same workspace as base thread {base_thread_id}"
+                ),
+            )
+            .await;
+            return;
+        }
+
+        let history_cwd = Some(base_cwd.clone());
         let request_overrides = cli_overrides.filter(|overrides| !overrides.is_empty());
         let mut typesafe_overrides = self.build_thread_config_overrides(
             model,
@@ -4228,16 +4270,16 @@ impl CodexMessageProcessor {
         let fallback_model_provider = config.model_provider_id.clone();
         let NewThread {
             thread_id,
-            thread: merged_thread,
+            thread: combined_thread,
             session_configured,
             ..
         } = match self
             .thread_manager
-            .merge_threads(
+            .combine_threads(
                 base_thread_id,
                 config,
                 base_path.clone(),
-                merge_sources
+                combine_sources
                     .iter()
                     .map(|source| (source.thread_id, source.path.clone()))
                     .collect(),
@@ -4247,7 +4289,7 @@ impl CodexMessageProcessor {
         {
             Ok(thread) => thread,
             Err(err) => {
-                self.send_internal_error(request_id, format!("error merging thread: {err}"))
+                self.send_internal_error(request_id, format!("error combining thread: {err}"))
                     .await;
                 return;
             }
@@ -4266,10 +4308,11 @@ impl CodexMessageProcessor {
             "thread",
         );
 
-        let mut thread = if let Some(merge_rollout_path) = session_configured.rollout_path.as_ref()
+        let mut thread = if let Some(combined_rollout_path) =
+            session_configured.rollout_path.as_ref()
         {
             match read_summary_from_rollout(
-                merge_rollout_path.as_path(),
+                combined_rollout_path.as_path(),
                 fallback_model_provider.as_str(),
             )
             .await
@@ -4280,7 +4323,7 @@ impl CodexMessageProcessor {
                         request_id,
                         format!(
                             "failed to load rollout `{}` for thread {thread_id}: {err}",
-                            merge_rollout_path.display()
+                            combined_rollout_path.display()
                         ),
                     )
                     .await;
@@ -4288,12 +4331,12 @@ impl CodexMessageProcessor {
                 }
             }
         } else {
-            let config_snapshot = merged_thread.config_snapshot().await;
+            let config_snapshot = combined_thread.config_snapshot().await;
             let mut thread = build_thread_from_snapshot(thread_id, &config_snapshot, None);
-            let history_items = match build_merged_rollout(
+            let history_items = match build_combined_rollout(
                 base_thread_id,
                 base_path.as_path(),
-                &merge_sources,
+                &combine_sources,
             )
             .await
             {
@@ -4302,7 +4345,7 @@ impl CodexMessageProcessor {
                     self.send_internal_error(
                         request_id,
                         format!(
-                            "failed to build merged history from `{}` for thread {thread_id}: {err}",
+                            "failed to build combined history from `{}` for thread {thread_id}: {err}",
                             base_path.display()
                         ),
                     )
@@ -4324,10 +4367,10 @@ impl CodexMessageProcessor {
             thread
         };
 
-        if let Some(merge_rollout_path) = session_configured.rollout_path.as_ref()
+        if let Some(combined_rollout_path) = session_configured.rollout_path.as_ref()
             && let Err(message) = populate_thread_turns(
                 &mut thread,
-                ThreadTurnSource::RolloutPath(merge_rollout_path.as_path()),
+                ThreadTurnSource::RolloutPath(combined_rollout_path.as_path()),
                 None,
             )
             .await
@@ -4503,6 +4546,7 @@ impl CodexMessageProcessor {
                     allowed_sources,
                     model_provider_filter.as_deref(),
                     fallback_provider.as_str(),
+                    false,
                     search_term.as_deref(),
                 )
                 .await
@@ -7940,28 +7984,6 @@ async fn derive_config_for_cwd(
         .await
 }
 
-async fn read_history_cwd_from_state_db(
-    config: &Config,
-    thread_id: Option<ThreadId>,
-    rollout_path: &Path,
-) -> Option<PathBuf> {
-    if let Some(state_db_ctx) = get_state_db(config).await
-        && let Some(thread_id) = thread_id
-        && let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await
-    {
-        return Some(metadata.cwd);
-    }
-
-    match read_session_meta_line(rollout_path).await {
-        Ok(meta_line) => Some(meta_line.meta.cwd),
-        Err(err) => {
-            let rollout_path = rollout_path.display();
-            warn!("failed to read session metadata from rollout {rollout_path}: {err}");
-            None
-        }
-    }
-}
-
 async fn read_summary_from_state_db_by_thread_id(
     config: &Config,
     thread_id: ThreadId,
@@ -8292,32 +8314,6 @@ fn preview_from_rollout_items(items: &[RolloutItem]) -> String {
             None => preview,
         })
         .unwrap_or_default()
-}
-
-async fn is_descendant_thread(codex_home: &Path, base_thread_id: ThreadId, path: &Path) -> bool {
-    let mut current_path = path.to_path_buf();
-    let mut seen = HashSet::new();
-
-    loop {
-        let Ok(meta_line) = read_session_meta_line(current_path.as_path()).await else {
-            return false;
-        };
-        let Some(parent_thread_id) = meta_line.meta.forked_from_id else {
-            return false;
-        };
-        if parent_thread_id == base_thread_id {
-            return true;
-        }
-        if !seen.insert(parent_thread_id) {
-            return false;
-        }
-        let Ok(Some(parent_path)) =
-            find_thread_path_by_id_str(codex_home, &parent_thread_id.to_string()).await
-        else {
-            return false;
-        };
-        current_path = parent_path;
-    }
 }
 
 fn with_thread_spawn_agent_metadata(

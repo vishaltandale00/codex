@@ -6,4 +6,31 @@ import type { JsonValue } from "../serde_json/JsonValue";
 import type { AskForApproval } from "./AskForApproval";
 import type { SandboxMode } from "./SandboxMode";
 
-export type ThreadMergeParams = { baseThreadId: string, mergeThreadIds: Array<string>, model?: string | null, modelProvider?: string | null, serviceTier?: ServiceTier | null | null, cwd?: string | null, approvalPolicy?: AskForApproval | null, sandbox?: SandboxMode | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, ephemeral?: boolean, };
+/**
+ * Create a new thread by combining the base thread with the selected source
+ * threads in request order.
+ *
+ * Every source thread must be in the same workspace as the base thread. Two
+ * threads are considered to be in the same workspace when their recorded
+ * `cwd`s are identical, or when both recorded `cwd`s resolve to the same Git
+ * repository root.
+ *
+ * The optional request `cwd` overrides the resulting thread's working
+ * directory, but it must also stay within the base thread's workspace.
+ */
+export type ThreadMergeParams = { 
+/**
+ * The thread whose history becomes the first segment of the combined
+ * thread.
+ */
+baseThreadId: string, 
+/**
+ * Additional threads to append after the base thread, in caller-specified
+ * order.
+ */
+mergeThreadIds: Array<string>, model?: string | null, modelProvider?: string | null, serviceTier?: ServiceTier | null | null, 
+/**
+ * Override the combined thread's working directory. This must stay within
+ * the same workspace as `baseThreadId`.
+ */
+cwd?: string | null, approvalPolicy?: AskForApproval | null, sandbox?: SandboxMode | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, ephemeral?: boolean, };

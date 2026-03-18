@@ -63,10 +63,17 @@ use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
 /// resumed/rebuilt thread history preserves the original turn identifiers.
 pub fn build_turns_from_rollout_items(items: &[RolloutItem]) -> Vec<Turn> {
     let mut builder = ThreadHistoryBuilder::new();
+    let mut turns = Vec::new();
     for item in items {
-        builder.handle_rollout_item(item);
+        match item {
+            RolloutItem::SessionMeta(_) | RolloutItem::MergeBoundary(_) => {
+                turns.extend(std::mem::take(&mut builder).finish());
+            }
+            _ => builder.handle_rollout_item(item),
+        }
     }
-    builder.finish()
+    turns.extend(builder.finish());
+    turns
 }
 
 pub struct ThreadHistoryBuilder {

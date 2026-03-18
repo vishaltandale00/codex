@@ -9,6 +9,13 @@ pub(super) struct RolloutReconstruction {
     pub(super) reference_context_item: Option<TurnContextItem>,
 }
 
+#[derive(Debug)]
+struct SegmentReconstruction {
+    history: Vec<ResponseItem>,
+    previous_turn_settings: Option<PreviousTurnSettings>,
+    reference_context_item: TurnReferenceContextItem,
+}
+
 #[derive(Debug, Default)]
 enum TurnReferenceContextItem {
     /// No `TurnContextItem` has been seen for this replay span yet.
@@ -88,6 +95,58 @@ impl Session {
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
     ) -> RolloutReconstruction {
+        let mut history = Vec::new();
+        let mut previous_turn_settings = None;
+        let mut reference_context_item = TurnReferenceContextItem::NeverSet;
+        let mut segment_items = Vec::new();
+
+        let mut flush_segment = |segment_items: &mut Vec<RolloutItem>| {
+            if segment_items.is_empty() {
+                return;
+            }
+            let segment = self.reconstruct_rollout_segment(turn_context, segment_items);
+            history.extend(segment.history);
+            if segment.previous_turn_settings.is_some() {
+                previous_turn_settings = segment.previous_turn_settings;
+            }
+            if !matches!(
+                segment.reference_context_item,
+                TurnReferenceContextItem::NeverSet
+            ) {
+                reference_context_item = segment.reference_context_item;
+            }
+            segment_items.clear();
+        };
+
+        for item in rollout_items {
+            match item {
+                RolloutItem::SessionMeta(_) | RolloutItem::MergeBoundary(_) => {
+                    flush_segment(&mut segment_items);
+                }
+                _ => segment_items.push(item.clone()),
+            }
+        }
+        flush_segment(&mut segment_items);
+
+        let reference_context_item = match reference_context_item {
+            TurnReferenceContextItem::NeverSet | TurnReferenceContextItem::Cleared => None,
+            TurnReferenceContextItem::Latest(turn_reference_context_item) => {
+                Some(*turn_reference_context_item)
+            }
+        };
+
+        RolloutReconstruction {
+            history,
+            previous_turn_settings,
+            reference_context_item,
+        }
+    }
+
+    fn reconstruct_rollout_segment(
+        &self,
+        turn_context: &TurnContext,
+        rollout_items: &[RolloutItem],
+    ) -> SegmentReconstruction {
         // Replay metadata should already match the shape of the future lazy reverse loader, even
         // while history materialization still uses an eager bridge. Scan newest-to-oldest,
         // stopping once a surviving replacement-history checkpoint and the required resume metadata
@@ -278,19 +337,13 @@ impl Session {
             }
         }
 
-        let reference_context_item = match reference_context_item {
-            TurnReferenceContextItem::NeverSet | TurnReferenceContextItem::Cleared => None,
-            TurnReferenceContextItem::Latest(turn_reference_context_item) => {
-                Some(*turn_reference_context_item)
-            }
-        };
         let reference_context_item = if saw_legacy_compaction_without_replacement_history {
-            None
+            TurnReferenceContextItem::Cleared
         } else {
             reference_context_item
         };
 
-        RolloutReconstruction {
+        SegmentReconstruction {
             history: history.raw_items().to_vec(),
             previous_turn_settings,
             reference_context_item,

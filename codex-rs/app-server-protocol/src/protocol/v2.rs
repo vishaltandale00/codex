@@ -2493,8 +2493,22 @@ pub struct ThreadForkResponse {
 )]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
+/// Create a new thread by combining the base thread with the selected source
+/// threads in request order.
+///
+/// Every source thread must be in the same workspace as the base thread. Two
+/// threads are considered to be in the same workspace when their recorded
+/// `cwd`s are identical, or when both recorded `cwd`s resolve to the same Git
+/// repository root.
+///
+/// The optional request `cwd` overrides the resulting thread's working
+/// directory, but it must also stay within the base thread's workspace.
 pub struct ThreadMergeParams {
+    /// The thread whose history becomes the first segment of the combined
+    /// thread.
     pub base_thread_id: String,
+    /// Additional threads to append after the base thread, in caller-specified
+    /// order.
     pub merge_thread_ids: Vec<String>,
 
     #[ts(optional = nullable)]
@@ -2509,6 +2523,8 @@ pub struct ThreadMergeParams {
     )]
     #[ts(optional = nullable)]
     pub service_tier: Option<Option<ServiceTier>>,
+    /// Override the combined thread's working directory. This must stay within
+    /// the same workspace as `baseThreadId`.
     #[ts(optional = nullable)]
     pub cwd: Option<String>,
     #[experimental(nested)]
@@ -3373,8 +3389,8 @@ pub struct Thread {
     pub git_info: Option<GitInfo>,
     /// Optional user-facing thread title.
     pub name: Option<String>,
-    /// Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read`
-    /// (when `includeTurns` is true) responses.
+    /// Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, `thread/merge`, and
+    /// `thread/read` (when `includeTurns` is true) responses.
     /// For all other responses and notifications returning a Thread,
     /// the turns field will be an empty list.
     pub turns: Vec<Turn>,

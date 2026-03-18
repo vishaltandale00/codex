@@ -27,6 +27,7 @@ use tokio_stream::StreamExt;
 pub(crate) enum CwdPromptAction {
     Resume,
     Fork,
+    Combine,
 }
 
 impl CwdPromptAction {
@@ -34,6 +35,7 @@ impl CwdPromptAction {
         match self {
             CwdPromptAction::Resume => "resume",
             CwdPromptAction::Fork => "fork",
+            CwdPromptAction::Combine => "combine",
         }
     }
 
@@ -41,6 +43,7 @@ impl CwdPromptAction {
         match self {
             CwdPromptAction::Resume => "resumed",
             CwdPromptAction::Fork => "forked",
+            CwdPromptAction::Combine => "combined",
         }
     }
 }
@@ -283,6 +286,21 @@ mod tests {
             .draw(|frame| frame.render_widget_ref(&screen, frame.area()))
             .expect("render cwd prompt");
         insta::assert_snapshot!("cwd_prompt_fork_modal", terminal.backend());
+    }
+
+    #[test]
+    fn cwd_prompt_combine_snapshot() {
+        let screen = CwdPromptScreen::new(
+            FrameRequester::test_dummy(),
+            CwdPromptAction::Combine,
+            "/Users/example/current".to_string(),
+            "/Users/example/session".to_string(),
+        );
+        let mut terminal = Terminal::new(VT100Backend::new(80, 14)).expect("terminal");
+        terminal
+            .draw(|frame| frame.render_widget_ref(&screen, frame.area()))
+            .expect("render cwd prompt");
+        insta::assert_snapshot!("cwd_prompt_combine_modal", terminal.backend());
     }
 
     #[test]

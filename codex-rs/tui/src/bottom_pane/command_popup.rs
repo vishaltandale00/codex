@@ -351,10 +351,7 @@ mod tests {
                 CommandItem::UserPrompt(_) => None,
             })
             .collect();
-        assert_eq!(
-            cmds,
-            vec!["model", "merge", "mention", "mcp", "multi-agents"]
-        );
+        assert_eq!(cmds, vec!["model", "mention", "mcp", "multi-agents"]);
     }
 
     #[test]

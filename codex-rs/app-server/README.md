@@ -128,6 +128,7 @@ Example with notification opt-out:
 - `thread/start` — create a new thread; emits `thread/started` (including the current `thread.status`) and auto-subscribes you to turn/item events for that thread.
 - `thread/resume` — reopen an existing thread by id so subsequent `turn/start` calls append to it.
 - `thread/fork` — fork an existing thread into a new thread id by copying the stored history; accepts `ephemeral: true` for an in-memory temporary fork, emits `thread/started` (including the current `thread.status`), and auto-subscribes you to turn/item events for the new thread.
+- `thread/merge` — combine selected threads from the same workspace into a new thread; each source must share the base thread's exact `cwd`, or the same Git repo root when both sides resolve. If `cwd` is provided in the request, it must also stay within that workspace.
 - `thread/list` — page through stored rollouts; supports cursor-based pagination and optional `modelProviders`, `sourceKinds`, `archived`, `cwd`, and `searchTerm` filters. Each returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded.
 - `thread/loaded/list` — list the thread ids currently loaded in memory.
 - `thread/read` — read a stored thread by id without resuming it; optionally include turns via `includeTurns`. The returned `thread` includes `status` (`ThreadStatus`), defaulting to `notLoaded` when the thread is not currently loaded.
@@ -237,6 +238,28 @@ To branch from a stored session, call `thread/fork` with the `thread.id`. This c
 { "method": "thread/fork", "id": 12, "params": { "threadId": "thr_123", "ephemeral": true } }
 { "id": 12, "result": { "thread": { "id": "thr_456", … } } }
 { "method": "thread/started", "params": { "thread": { … } } }
+```
+
+To combine stored sessions from the same workspace, call `thread/merge` with a base thread and the source thread ids in the order you want appended. The threads must either share the same recorded `cwd`, or resolve to the same Git repo root:
+
+```json
+{ "method": "thread/merge", "id": 13, "params": {
+    "baseThreadId": "thr_base",
+    "mergeThreadIds": ["thr_a", "thr_b"],
+    "ephemeral": true
+} }
+{ "id": 13, "result": { "thread": { "id": "thr_combined", … } } }
+{ "method": "thread/started", "params": { "thread": { … } } }
+```
+
+If a selected source falls outside the base thread's workspace, the request is rejected:
+
+```json
+{ "method": "thread/merge", "id": 14, "params": {
+    "baseThreadId": "thr_base",
+    "mergeThreadIds": ["thr_other_workspace"]
+} }
+{ "id": 14, "error": { "code": -32600, "message": "thread thr_other_workspace is not in the same workspace as base thread thr_base" } }
 ```
 
 Experimental API: `thread/start`, `thread/resume`, and `thread/fork` accept `persistExtendedHistory: true` to persist a richer subset of ThreadItems for non-lossy history when calling `thread/read`, `thread/resume`, and `thread/fork` later. This does not backfill events that were not persisted previously.
