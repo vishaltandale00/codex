@@ -20,8 +20,7 @@ use codex_core::ThreadSortKey;
 use codex_core::ThreadsPage;
 use codex_core::config::Config;
 use codex_core::find_thread_names_by_ids;
-use codex_core::path_utils;
-use codex_core::paths_share_workspace;
+use codex_core::paths_match;
 use codex_protocol::ThreadId;
 use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
@@ -108,12 +107,8 @@ impl SessionPickerAction {
     }
 
     fn matches_filter_cwd(self, row_cwd: &Path, filter_cwd: &Path) -> bool {
-        match self {
-            SessionPickerAction::Combine => paths_share_workspace(row_cwd, filter_cwd),
-            SessionPickerAction::Resume | SessionPickerAction::Fork => {
-                paths_match(row_cwd, filter_cwd)
-            }
-        }
+        let _ = self;
+        paths_match(row_cwd, filter_cwd)
     }
 }
 
@@ -123,7 +118,6 @@ struct PageLoadRequest {
     request_token: usize,
     search_token: Option<usize>,
     default_provider: String,
-    limit_to_default_provider: bool,
     sort_key: ThreadSortKey,
 }
 
@@ -151,14 +145,14 @@ enum BackgroundEvent {
 ///
 /// Filtering happens in two layers:
 /// 1. Provider and source filtering at the backend (only interactive CLI sessions
-///    for the current model provider, unless the caller opts into all providers).
+///    for the current model provider).
 /// 2. Working-directory filtering at the picker (unless `--all` is passed).
 pub async fn run_resume_picker(
     tui: &mut Tui,
     config: &Config,
     show_all: bool,
 ) -> Result<SessionSelection> {
-    run_session_picker(tui, config, show_all, SessionPickerAction::Resume, true).await
+    run_session_picker(tui, config, show_all, SessionPickerAction::Resume).await
 }
 
 pub async fn run_fork_picker(
@@ -166,15 +160,15 @@ pub async fn run_fork_picker(
     config: &Config,
     show_all: bool,
 ) -> Result<SessionSelection> {
-    run_session_picker(tui, config, show_all, SessionPickerAction::Fork, true).await
+    run_session_picker(tui, config, show_all, SessionPickerAction::Fork).await
 }
 
-pub async fn run_combine_picker_all_providers(
+pub async fn run_combine_picker(
     tui: &mut Tui,
     config: &Config,
     show_all: bool,
 ) -> Result<SessionSelection> {
-    run_session_picker(tui, config, show_all, SessionPickerAction::Combine, false).await
+    run_session_picker(tui, config, show_all, SessionPickerAction::Combine).await
 }
 
 async fn run_session_picker(
@@ -182,7 +176,6 @@ async fn run_session_picker(
     config: &Config,
     show_all: bool,
     action: SessionPickerAction,
-    limit_to_default_provider: bool,
 ) -> Result<SessionSelection> {
     let alt = AltScreenGuard::enter(tui);
     let (bg_tx, bg_rx) = mpsc::unbounded_channel();
@@ -199,16 +192,14 @@ async fn run_session_picker(
         let config = config.clone();
         let action = action_for_loader;
         tokio::spawn(async move {
-            let provider_filter = request
-                .limit_to_default_provider
-                .then(|| vec![request.default_provider.clone()]);
+            let provider_filter = vec![request.default_provider.clone()];
             let page = RolloutRecorder::list_threads(
                 &config,
                 PAGE_SIZE,
                 request.cursor.as_ref(),
                 request.sort_key,
                 INTERACTIVE_SESSION_SOURCES,
-                provider_filter.as_deref(),
+                Some(&provider_filter),
                 request.default_provider.as_str(),
                 action.include_empty_threads(),
                 /*search_term*/ None,
@@ -227,7 +218,6 @@ async fn run_session_picker(
         alt.tui.frame_requester(),
         page_loader,
         default_provider.clone(),
-        limit_to_default_provider,
         show_all,
         filter_cwd,
         action,
@@ -318,7 +308,6 @@ struct PickerState {
     page_loader: PageLoader,
     view_rows: Option<usize>,
     default_provider: String,
-    limit_to_default_provider: bool,
     show_all: bool,
     filter_cwd: Option<PathBuf>,
     action: SessionPickerAction,
@@ -412,7 +401,6 @@ impl PickerState {
         requester: FrameRequester,
         page_loader: PageLoader,
         default_provider: String,
-        limit_to_default_provider: bool,
         show_all: bool,
         filter_cwd: Option<PathBuf>,
         action: SessionPickerAction,
@@ -438,7 +426,6 @@ impl PickerState {
             page_loader,
             view_rows: None,
             default_provider,
-            limit_to_default_provider,
             show_all,
             filter_cwd,
             action,
@@ -573,7 +560,6 @@ impl PickerState {
             request_token,
             search_token,
             default_provider: self.default_provider.clone(),
-            limit_to_default_provider: self.limit_to_default_provider,
             sort_key: self.sort_key,
         });
     }
@@ -844,7 +830,6 @@ impl PickerState {
             request_token,
             search_token,
             default_provider: self.default_provider.clone(),
-            limit_to_default_provider: self.limit_to_default_provider,
             sort_key: self.sort_key,
         });
     }
@@ -905,16 +890,6 @@ fn head_to_row(item: &ThreadItem) -> Row {
         cwd: item.cwd.clone(),
         git_branch: item.git_branch.clone(),
     }
-}
-
-fn paths_match(a: &Path, b: &Path) -> bool {
-    if let (Ok(ca), Ok(cb)) = (
-        path_utils::normalize_for_path_comparison(a),
-        path_utils::normalize_for_path_comparison(b),
-    ) {
-        return ca == cb;
-    }
-    a == b
 }
 
 fn parse_timestamp_str(ts: &str) -> Option<DateTime<Utc>> {
@@ -1584,7 +1559,6 @@ mod tests {
             loader,
             String::from("openai"),
             false,
-            false,
             None,
             SessionPickerAction::Combine,
         );
@@ -1598,7 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn combine_picker_matches_sibling_worktrees_in_same_repo() {
+    fn combine_picker_requires_exact_workspace_match() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let repo_root = tempdir.path().join("repo");
         let current_cwd = repo_root.join("workspace-a");
@@ -1614,7 +1588,6 @@ mod tests {
             loader,
             String::from("openai"),
             false,
-            false,
             Some(current_cwd),
             SessionPickerAction::Combine,
         );
@@ -1629,7 +1602,7 @@ mod tests {
             git_branch: None,
         };
 
-        assert!(state.row_matches_filter(&row));
+        assert!(!state.row_matches_filter(&row));
     }
 
     #[test]
@@ -1648,7 +1621,6 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
-            true,
             false,
             Some(current_cwd),
             SessionPickerAction::Resume,
@@ -1743,7 +1715,6 @@ mod tests {
             loader,
             String::from("openai"),
             true,
-            true,
             None,
             SessionPickerAction::Resume,
         );
@@ -1822,7 +1793,6 @@ mod tests {
             loader,
             String::from("openai"),
             true,
-            true,
             None,
             SessionPickerAction::Resume,
         );
@@ -1858,7 +1828,6 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
-            false,
             true,
             None,
             SessionPickerAction::Combine,
@@ -2121,7 +2090,6 @@ mod tests {
             loader,
             String::from("openai"),
             true,
-            true,
             None,
             SessionPickerAction::Resume,
         );
@@ -2188,7 +2156,6 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
-            true,
             true,
             None,
             SessionPickerAction::Resume,
@@ -2258,7 +2225,6 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
-            true,
             true,
             None,
             SessionPickerAction::Resume,
@@ -2341,7 +2307,6 @@ mod tests {
             loader,
             String::from("openai"),
             true,
-            true,
             None,
             SessionPickerAction::Resume,
         );
@@ -2361,32 +2326,6 @@ mod tests {
         let guard = recorded_requests.lock().unwrap();
         assert_eq!(guard.len(), 2);
         assert_eq!(guard[1].sort_key, ThreadSortKey::CreatedAt);
-    }
-
-    #[test]
-    fn initial_load_can_disable_default_provider_filter() {
-        let recorded_requests: Arc<Mutex<Vec<PageLoadRequest>>> = Arc::new(Mutex::new(Vec::new()));
-        let request_sink = recorded_requests.clone();
-        let loader: PageLoader = Arc::new(move |req: PageLoadRequest| {
-            request_sink.lock().unwrap().push(req);
-        });
-
-        let mut state = PickerState::new(
-            PathBuf::from("/tmp"),
-            FrameRequester::test_dummy(),
-            loader,
-            String::from("openai"),
-            false,
-            true,
-            None,
-            SessionPickerAction::Resume,
-        );
-
-        state.start_initial_load();
-
-        let guard = recorded_requests.lock().unwrap();
-        assert_eq!(guard.len(), 1);
-        assert_eq!(guard[0].limit_to_default_provider, false);
     }
 
     #[tokio::test]
@@ -2415,7 +2354,6 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
-            true,
             true,
             None,
             SessionPickerAction::Resume,
@@ -2462,7 +2400,6 @@ mod tests {
             loader,
             String::from("openai"),
             true,
-            true,
             None,
             SessionPickerAction::Resume,
         );
@@ -2502,7 +2439,6 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
-            true,
             true,
             None,
             SessionPickerAction::Resume,
@@ -2548,7 +2484,6 @@ mod tests {
             FrameRequester::test_dummy(),
             loader,
             String::from("openai"),
-            true,
             true,
             None,
             SessionPickerAction::Resume,

@@ -226,11 +226,6 @@ client_request_definitions! {
         inspect_params: true,
         response: v2::ThreadForkResponse,
     },
-    ThreadMerge => "thread/merge" {
-        params: v2::ThreadMergeParams,
-        inspect_params: true,
-        response: v2::ThreadMergeResponse,
-    },
     ThreadArchive => "thread/archive" {
         params: v2::ThreadArchiveParams,
         response: v2::ThreadArchiveResponse,

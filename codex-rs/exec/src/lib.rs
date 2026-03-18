@@ -1044,8 +1044,6 @@ fn session_configured_from_thread_response(
     Ok(SessionConfiguredEvent {
         session_id,
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name,
         model,
         model_provider_id,

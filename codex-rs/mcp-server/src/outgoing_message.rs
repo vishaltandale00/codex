@@ -297,8 +297,6 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-4o".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -343,8 +341,6 @@ mod tests {
         let session_configured_event = SessionConfiguredEvent {
             session_id: conversation_id,
             forked_from_id: None,
-            merge_base_thread_id: None,
-            merged_from_thread_ids: Vec::new(),
             thread_name: None,
             model: "gpt-4o".to_string(),
             model_provider_id: "test-provider".to_string(),
@@ -414,8 +410,6 @@ mod tests {
         let session_configured_event = SessionConfiguredEvent {
             session_id: thread_id,
             forked_from_id: None,
-            merge_base_thread_id: None,
-            merged_from_thread_ids: Vec::new(),
             thread_name: None,
             model: "gpt-4o".to_string(),
             model_provider_id: "test-provider".to_string(),

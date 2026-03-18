@@ -183,8 +183,6 @@ async fn resumed_initial_messages_render_history() {
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -295,8 +293,6 @@ async fn replayed_user_message_preserves_text_elements_and_local_images() {
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -358,8 +354,6 @@ async fn replayed_user_message_preserves_remote_image_urls() {
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -428,8 +422,6 @@ async fn session_configured_syncs_widget_config_permissions_and_cwd() {
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: ThreadId::new(),
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -473,8 +465,6 @@ async fn replayed_user_message_with_only_remote_images_renders_history_cell() {
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -528,8 +518,6 @@ async fn replayed_user_message_with_only_local_images_does_not_render_history_ce
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -679,74 +667,6 @@ async fn combined_thread_history_line_includes_names_and_ids_snapshot() {
 }
 
 #[tokio::test]
-async fn session_configured_prefers_combined_history_over_fork_history() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
-    let temp = tempdir().expect("tempdir");
-    chat.config.codex_home = temp.path().to_path_buf();
-
-    let base_thread_id =
-        ThreadId::from_string("019cc2bf-bb0f-7e21-a884-df288ff96f95").expect("base id");
-    let combined_thread_id =
-        ThreadId::from_string("019cc2bf-bb0f-7e21-a884-df288ff96fa1").expect("combined id");
-    let session_index_entry = format!(
-        concat!(
-            "{{\"id\":\"{}\",\"thread_name\":\"playwright test frontend\",\"updated_at\":\"2024-01-02T00:00:00Z\"}}\n",
-            "{{\"id\":\"{}\",\"thread_name\":\"checkout smoke follow-up\",\"updated_at\":\"2024-01-03T00:00:00Z\"}}\n"
-        ),
-        base_thread_id, combined_thread_id,
-    );
-    std::fs::write(temp.path().join("session_index.jsonl"), session_index_entry)
-        .expect("write session index");
-
-    let rollout_file = NamedTempFile::new().expect("rollout file");
-    chat.handle_codex_event(Event {
-        id: "initial".into(),
-        msg: EventMsg::SessionConfigured(codex_protocol::protocol::SessionConfiguredEvent {
-            session_id: ThreadId::new(),
-            forked_from_id: Some(base_thread_id),
-            merge_base_thread_id: Some(base_thread_id),
-            merged_from_thread_ids: vec![combined_thread_id],
-            thread_name: None,
-            model: "test-model".to_string(),
-            model_provider_id: "test-provider".to_string(),
-            service_tier: None,
-            approval_policy: AskForApproval::Never,
-            approvals_reviewer: ApprovalsReviewer::User,
-            sandbox_policy: SandboxPolicy::new_read_only_policy(),
-            cwd: PathBuf::from("/home/user/project"),
-            reasoning_effort: Some(ReasoningEffortConfig::default()),
-            history_log_id: 0,
-            history_entry_count: 0,
-            initial_messages: None,
-            network_proxy: None,
-            rollout_path: Some(rollout_file.path().to_path_buf()),
-        }),
-    });
-
-    let history_cell = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            match rx.recv().await {
-                Some(AppEvent::InsertHistoryCell(cell)) => {
-                    let rendered = lines_to_single_string(&cell.display_lines(120));
-                    if rendered.contains("Thread combined from")
-                        || rendered.contains("Thread forked from")
-                    {
-                        break rendered;
-                    }
-                }
-                Some(_) => continue,
-                None => panic!("app event channel closed before thread history was emitted"),
-            }
-        }
-    })
-    .await
-    .expect("timed out waiting for thread history");
-
-    assert!(history_cell.contains("Thread combined from"));
-    assert!(!history_cell.contains("Thread forked from"));
-}
-
-#[tokio::test]
 async fn submission_preserves_text_elements_and_local_images() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(None).await;
 
@@ -755,8 +675,6 @@ async fn submission_preserves_text_elements_and_local_images() {
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -841,8 +759,6 @@ async fn submission_with_remote_and_local_images_keeps_local_placeholder_numberi
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -938,8 +854,6 @@ async fn enter_with_only_remote_images_submits_user_turn() {
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -1005,8 +919,6 @@ async fn shift_enter_with_only_remote_images_does_not_submit_user_turn() {
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -1047,8 +959,6 @@ async fn enter_with_only_remote_images_does_not_submit_when_modal_is_active() {
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -1089,8 +999,6 @@ async fn enter_with_only_remote_images_does_not_submit_when_input_disabled() {
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -1132,8 +1040,6 @@ async fn submission_prefers_selected_duplicate_skill_path() {
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -4455,8 +4361,6 @@ async fn submit_user_message_emits_structured_plugin_mentions_from_bindings() {
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: conversation_id,
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -5776,8 +5680,6 @@ async fn plan_slash_command_with_args_submits_prompt_in_plan_mode() {
     let configured = codex_protocol::protocol::SessionConfiguredEvent {
         session_id: ThreadId::new(),
         forked_from_id: None,
-        merge_base_thread_id: None,
-        merged_from_thread_ids: Vec::new(),
         thread_name: None,
         model: "test-model".to_string(),
         model_provider_id: "test-provider".to_string(),
@@ -9007,8 +8909,6 @@ async fn permissions_selection_marks_guardian_approvals_current_after_session_co
         msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
             session_id: ThreadId::new(),
             forked_from_id: None,
-            merge_base_thread_id: None,
-            merged_from_thread_ids: Vec::new(),
             thread_name: None,
             model: "gpt-test".to_string(),
             model_provider_id: "test-provider".to_string(),
@@ -9059,8 +8959,6 @@ async fn permissions_selection_marks_guardian_approvals_current_with_custom_work
         msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
             session_id: ThreadId::new(),
             forked_from_id: None,
-            merge_base_thread_id: None,
-            merged_from_thread_ids: Vec::new(),
             thread_name: None,
             model: "gpt-test".to_string(),
             model_provider_id: "test-provider".to_string(),

@@ -127,8 +127,6 @@ use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadLoadedListParams;
 use codex_app_server_protocol::ThreadLoadedListResponse;
-use codex_app_server_protocol::ThreadMergeParams;
-use codex_app_server_protocol::ThreadMergeResponse;
 use codex_app_server_protocol::ThreadMetadataGitInfoUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateParams;
 use codex_app_server_protocol::ThreadMetadataUpdateResponse;
@@ -180,7 +178,6 @@ use codex_cloud_requirements::cloud_requirements_loader;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::CodexThread;
-use codex_core::CombineSource;
 use codex_core::Cursor as RolloutCursor;
 use codex_core::NewThread;
 use codex_core::RolloutRecorder;
@@ -193,7 +190,6 @@ use codex_core::auth::AuthMode as CoreAuthMode;
 use codex_core::auth::CLIENT_ID;
 use codex_core::auth::login_with_api_key;
 use codex_core::auth::login_with_chatgpt_auth_tokens;
-use codex_core::build_combined_rollout;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::NetworkProxyAuditMetadata;
@@ -223,7 +219,6 @@ use codex_core::mcp::collect_mcp_snapshot;
 use codex_core::mcp::group_tools_by_server;
 use codex_core::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_core::parse_cursor;
-use codex_core::paths_share_workspace;
 use codex_core::plugins::MarketplaceError;
 use codex_core::plugins::MarketplacePluginSource;
 use codex_core::plugins::PluginInstallError as CorePluginInstallError;
@@ -642,10 +637,6 @@ impl CodexMessageProcessor {
             }
             ClientRequest::ThreadFork { request_id, params } => {
                 self.thread_fork(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::ThreadMerge { request_id, params } => {
-                self.thread_combine(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::ThreadArchive { request_id, params } => {
@@ -4092,359 +4083,6 @@ impl CodexMessageProcessor {
 
         self.outgoing.send_response(request_id, response).await;
 
-        let notif = ThreadStartedNotification { thread };
-        self.outgoing
-            .send_server_notification(ServerNotification::ThreadStarted(notif))
-            .await;
-    }
-
-    async fn thread_combine(&mut self, request_id: ConnectionRequestId, params: ThreadMergeParams) {
-        let ThreadMergeParams {
-            base_thread_id,
-            merge_thread_ids: combine_thread_ids,
-            model,
-            model_provider,
-            service_tier,
-            cwd,
-            approval_policy,
-            sandbox,
-            config: cli_overrides,
-            base_instructions,
-            developer_instructions,
-            ephemeral,
-        } = params;
-
-        if combine_thread_ids.is_empty() {
-            self.send_invalid_request_error(
-                request_id,
-                "mergeThreadIds must not be empty".to_string(),
-            )
-            .await;
-            return;
-        }
-
-        let base_thread_id = match ThreadId::from_string(&base_thread_id) {
-            Ok(id) => id,
-            Err(err) => {
-                self.send_invalid_request_error(
-                    request_id,
-                    format!("invalid base thread id: {err}"),
-                )
-                .await;
-                return;
-            }
-        };
-
-        let base_path =
-            match find_thread_path_by_id_str(&self.config.codex_home, &base_thread_id.to_string())
-                .await
-            {
-                Ok(Some(path)) => path,
-                Ok(None) => {
-                    self.send_invalid_request_error(
-                        request_id,
-                        format!("no rollout found for thread id {base_thread_id}"),
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) => {
-                    self.send_invalid_request_error(
-                        request_id,
-                        format!("failed to locate thread id {base_thread_id}: {err}"),
-                    )
-                    .await;
-                    return;
-                }
-            };
-
-        let mut seen_combine_ids = std::collections::HashSet::new();
-        let mut combine_sources = Vec::new();
-        for combine_thread_id in combine_thread_ids {
-            let combine_thread_uuid = match ThreadId::from_string(&combine_thread_id) {
-                Ok(id) => id,
-                Err(err) => {
-                    self.send_invalid_request_error(
-                        request_id,
-                        format!("invalid source thread id `{combine_thread_id}`: {err}"),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            if combine_thread_uuid == base_thread_id {
-                self.send_invalid_request_error(
-                    request_id,
-                    "baseThreadId cannot appear in mergeThreadIds".to_string(),
-                )
-                .await;
-                return;
-            }
-            if !seen_combine_ids.insert(combine_thread_uuid) {
-                self.send_invalid_request_error(
-                    request_id,
-                    format!("duplicate source thread id {combine_thread_uuid}"),
-                )
-                .await;
-                return;
-            }
-            let combine_path = match find_thread_path_by_id_str(
-                &self.config.codex_home,
-                &combine_thread_uuid.to_string(),
-            )
-            .await
-            {
-                Ok(Some(path)) => path,
-                Ok(None) => {
-                    self.send_invalid_request_error(
-                        request_id,
-                        format!("no rollout found for thread id {combine_thread_uuid}"),
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) => {
-                    self.send_invalid_request_error(
-                        request_id,
-                        format!("failed to locate thread id {combine_thread_uuid}: {err}"),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            combine_sources.push(CombineSource {
-                thread_id: combine_thread_uuid,
-                path: combine_path,
-            });
-        }
-
-        let Some(base_cwd) =
-            resolve_recorded_thread_cwd(&self.config, Some(base_thread_id), base_path.as_path())
-                .await
-        else {
-            self.send_invalid_request_error(
-                request_id,
-                format!("failed to determine workspace cwd for base thread {base_thread_id}"),
-            )
-            .await;
-            return;
-        };
-
-        for source in &combine_sources {
-            let Some(source_cwd) = resolve_recorded_thread_cwd(
-                &self.config,
-                Some(source.thread_id),
-                source.path.as_path(),
-            )
-            .await
-            else {
-                self.send_invalid_request_error(
-                    request_id,
-                    format!(
-                        "failed to determine workspace cwd for source thread {}",
-                        source.thread_id
-                    ),
-                )
-                .await;
-                return;
-            };
-
-            if !paths_share_workspace(base_cwd.as_path(), source_cwd.as_path()) {
-                self.send_invalid_request_error(
-                    request_id,
-                    format!(
-                        "thread {} is not in the same workspace as base thread {base_thread_id}",
-                        source.thread_id
-                    ),
-                )
-                .await;
-                return;
-            }
-        }
-
-        if let Some(request_cwd) = cwd.as_ref()
-            && !paths_share_workspace(base_cwd.as_path(), Path::new(request_cwd))
-        {
-            self.send_invalid_request_error(
-                request_id,
-                format!(
-                    "requested cwd {request_cwd} is not in the same workspace as base thread {base_thread_id}"
-                ),
-            )
-            .await;
-            return;
-        }
-
-        let history_cwd = Some(base_cwd.clone());
-        let request_overrides = cli_overrides.filter(|overrides| !overrides.is_empty());
-        let mut typesafe_overrides = self.build_thread_config_overrides(
-            model,
-            model_provider,
-            service_tier,
-            cwd,
-            approval_policy,
-            /*approvals_reviewer*/ None,
-            sandbox,
-            base_instructions,
-            developer_instructions,
-            /*personality*/ None,
-        );
-        typesafe_overrides.ephemeral = ephemeral.then_some(true);
-        let cloud_requirements = self.current_cloud_requirements();
-        let config = match derive_config_for_cwd(
-            &self.cli_overrides,
-            request_overrides,
-            typesafe_overrides,
-            history_cwd,
-            &cloud_requirements,
-            &self.config.codex_home,
-        )
-        .await
-        {
-            Ok(config) => config,
-            Err(err) => {
-                self.outgoing
-                    .send_error(request_id, config_load_error(&err))
-                    .await;
-                return;
-            }
-        };
-
-        let fallback_model_provider = config.model_provider_id.clone();
-        let NewThread {
-            thread_id,
-            thread: combined_thread,
-            session_configured,
-            ..
-        } = match self
-            .thread_manager
-            .combine_threads(
-                base_thread_id,
-                config,
-                base_path.clone(),
-                combine_sources
-                    .iter()
-                    .map(|source| (source.thread_id, source.path.clone()))
-                    .collect(),
-                self.request_trace_context(&request_id).await,
-            )
-            .await
-        {
-            Ok(thread) => thread,
-            Err(err) => {
-                self.send_internal_error(request_id, format!("error combining thread: {err}"))
-                    .await;
-                return;
-            }
-        };
-
-        Self::log_listener_attach_result(
-            self.ensure_conversation_listener(
-                thread_id,
-                request_id.connection_id,
-                false,
-                ApiVersion::V2,
-            )
-            .await,
-            thread_id,
-            request_id.connection_id,
-            "thread",
-        );
-
-        let mut thread = if let Some(combined_rollout_path) =
-            session_configured.rollout_path.as_ref()
-        {
-            match read_summary_from_rollout(
-                combined_rollout_path.as_path(),
-                fallback_model_provider.as_str(),
-            )
-            .await
-            {
-                Ok(summary) => summary_to_thread(summary),
-                Err(err) => {
-                    self.send_internal_error(
-                        request_id,
-                        format!(
-                            "failed to load rollout `{}` for thread {thread_id}: {err}",
-                            combined_rollout_path.display()
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            }
-        } else {
-            let config_snapshot = combined_thread.config_snapshot().await;
-            let mut thread = build_thread_from_snapshot(thread_id, &config_snapshot, None);
-            let history_items = match build_combined_rollout(
-                base_thread_id,
-                base_path.as_path(),
-                &combine_sources,
-            )
-            .await
-            {
-                Ok(items) => items,
-                Err(err) => {
-                    self.send_internal_error(
-                        request_id,
-                        format!(
-                            "failed to build combined history from `{}` for thread {thread_id}: {err}",
-                            base_path.display()
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            thread.preview = preview_from_rollout_items(&history_items);
-            if let Err(message) = populate_thread_turns(
-                &mut thread,
-                ThreadTurnSource::HistoryItems(&history_items),
-                None,
-            )
-            .await
-            {
-                self.send_internal_error(request_id, message).await;
-                return;
-            }
-            thread
-        };
-
-        if let Some(combined_rollout_path) = session_configured.rollout_path.as_ref()
-            && let Err(message) = populate_thread_turns(
-                &mut thread,
-                ThreadTurnSource::RolloutPath(combined_rollout_path.as_path()),
-                None,
-            )
-            .await
-        {
-            self.send_internal_error(request_id, message).await;
-            return;
-        }
-
-        self.thread_watch_manager
-            .upsert_thread_silently(thread.clone())
-            .await;
-
-        thread.status = resolve_thread_status(
-            self.thread_watch_manager
-                .loaded_status_for_thread(&thread.id)
-                .await,
-            false,
-        );
-
-        let response = ThreadMergeResponse {
-            thread: thread.clone(),
-            model: session_configured.model,
-            model_provider: session_configured.model_provider_id,
-            service_tier: session_configured.service_tier,
-            cwd: session_configured.cwd,
-            approval_policy: session_configured.approval_policy.into(),
-            sandbox: session_configured.sandbox_policy.into(),
-            reasoning_effort: session_configured.reasoning_effort,
-        };
-
-        self.outgoing.send_response(request_id, response).await;
         let notif = ThreadStartedNotification { thread };
         self.outgoing
             .send_server_notification(ServerNotification::ThreadStarted(notif))

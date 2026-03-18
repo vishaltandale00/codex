@@ -64,8 +64,8 @@ gitInfo: GitInfo | null,
  */
 name: string | null, 
 /**
- * Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, `thread/merge`, and
- * `thread/read` (when `includeTurns` is true) responses.
+ * Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read`
+ * (when `includeTurns` is true) responses.
  * For all other responses and notifications returning a Thread,
  * the turns field will be an empty list.
  */

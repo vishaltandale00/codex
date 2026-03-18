@@ -1,5 +1,4 @@
 use crate::config::Config;
-use crate::git_info::resolve_root_git_project_for_trust;
 use crate::path_utils::normalize_for_path_comparison;
 use crate::rollout::list::read_session_meta_line;
 use crate::state_db::get_state_db;
@@ -32,21 +31,7 @@ pub async fn resolve_recorded_thread_cwd(
     }
 }
 
-pub fn paths_share_workspace(lhs_cwd: &Path, rhs_cwd: &Path) -> bool {
-    if paths_match(lhs_cwd, rhs_cwd) {
-        return true;
-    }
-
-    match (
-        resolve_root_git_project_for_trust(lhs_cwd),
-        resolve_root_git_project_for_trust(rhs_cwd),
-    ) {
-        (Some(lhs_root), Some(rhs_root)) => paths_match(lhs_root.as_path(), rhs_root.as_path()),
-        _ => false,
-    }
-}
-
-fn paths_match(lhs: &Path, rhs: &Path) -> bool {
+pub fn paths_match(lhs: &Path, rhs: &Path) -> bool {
     if let (Ok(lhs), Ok(rhs)) = (
         normalize_for_path_comparison(lhs),
         normalize_for_path_comparison(rhs),
@@ -59,7 +44,7 @@ fn paths_match(lhs: &Path, rhs: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::paths_share_workspace;
+    use super::paths_match;
     use super::resolve_recorded_thread_cwd;
     use crate::config::ConfigBuilder;
     use chrono::DateTime;
@@ -185,7 +170,16 @@ mod tests {
     }
 
     #[test]
-    fn paths_share_workspace_matches_sibling_worktrees_in_same_repo() {
+    fn paths_match_matches_identical_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+
+        assert!(paths_match(workspace.as_path(), workspace.as_path()));
+    }
+
+    #[test]
+    fn paths_match_rejects_sibling_worktrees_in_same_repo() {
         let temp = TempDir::new().expect("tempdir");
         let repo_root = temp.path().join("repo");
         let workspace_a = repo_root.join("workspace-a");
@@ -194,27 +188,6 @@ mod tests {
         std::fs::create_dir_all(&workspace_a).expect("create workspace a");
         std::fs::create_dir_all(&workspace_b).expect("create workspace b");
 
-        assert!(paths_share_workspace(
-            workspace_a.as_path(),
-            workspace_b.as_path()
-        ));
-    }
-
-    #[test]
-    fn paths_share_workspace_rejects_different_repo_roots() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo_a = temp.path().join("repo-a");
-        let repo_b = temp.path().join("repo-b");
-        let workspace_a = repo_a.join("workspace");
-        let workspace_b = repo_b.join("workspace");
-        std::fs::create_dir_all(repo_a.join(".git")).expect("create repo a");
-        std::fs::create_dir_all(repo_b.join(".git")).expect("create repo b");
-        std::fs::create_dir_all(&workspace_a).expect("create workspace a");
-        std::fs::create_dir_all(&workspace_b).expect("create workspace b");
-
-        assert!(!paths_share_workspace(
-            workspace_a.as_path(),
-            workspace_b.as_path()
-        ));
+        assert!(!paths_match(workspace_a.as_path(), workspace_b.as_path()));
     }
 }

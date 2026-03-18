@@ -2700,75 +2700,6 @@ pub struct ThreadForkResponse {
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
-#[derive(
-    Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS, ExperimentalApi,
-)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-/// Create a new thread by combining the base thread with the selected source
-/// threads in request order.
-///
-/// Every source thread must be in the same workspace as the base thread. Two
-/// threads are considered to be in the same workspace when their recorded
-/// `cwd`s are identical, or when both recorded `cwd`s resolve to the same Git
-/// repository root.
-///
-/// The optional request `cwd` overrides the resulting thread's working
-/// directory, but it must also stay within the base thread's workspace.
-pub struct ThreadMergeParams {
-    /// The thread whose history becomes the first segment of the combined
-    /// thread.
-    pub base_thread_id: String,
-    /// Additional threads to append after the base thread, in caller-specified
-    /// order.
-    pub merge_thread_ids: Vec<String>,
-
-    #[ts(optional = nullable)]
-    pub model: Option<String>,
-    #[ts(optional = nullable)]
-    pub model_provider: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "super::serde_helpers::deserialize_double_option",
-        serialize_with = "super::serde_helpers::serialize_double_option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    #[ts(optional = nullable)]
-    pub service_tier: Option<Option<ServiceTier>>,
-    /// Override the combined thread's working directory. This must stay within
-    /// the same workspace as `baseThreadId`.
-    #[ts(optional = nullable)]
-    pub cwd: Option<String>,
-    #[experimental(nested)]
-    #[ts(optional = nullable)]
-    pub approval_policy: Option<AskForApproval>,
-    #[ts(optional = nullable)]
-    pub sandbox: Option<SandboxMode>,
-    #[ts(optional = nullable)]
-    pub config: Option<HashMap<String, serde_json::Value>>,
-    #[ts(optional = nullable)]
-    pub base_instructions: Option<String>,
-    #[ts(optional = nullable)]
-    pub developer_instructions: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub ephemeral: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
-#[serde(rename_all = "camelCase")]
-#[ts(export_to = "v2/")]
-pub struct ThreadMergeResponse {
-    pub thread: Thread,
-    pub model: String,
-    pub model_provider: String,
-    pub service_tier: Option<ServiceTier>,
-    pub cwd: PathBuf,
-    #[experimental(nested)]
-    pub approval_policy: AskForApproval,
-    pub sandbox: SandboxPolicy,
-    pub reasoning_effort: Option<ReasoningEffort>,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -3550,8 +3481,8 @@ pub struct Thread {
     pub git_info: Option<GitInfo>,
     /// Optional user-facing thread title.
     pub name: Option<String>,
-    /// Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, `thread/merge`, and
-    /// `thread/read` (when `includeTurns` is true) responses.
+    /// Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read`
+    /// (when `includeTurns` is true) responses.
     /// For all other responses and notifications returning a Thread,
     /// the turns field will be an empty list.
     pub turns: Vec<Turn>,
@@ -7829,40 +7760,5 @@ mod tests {
         let serialized_without_override =
             serde_json::to_value(&without_override).expect("params should serialize");
         assert_eq!(serialized_without_override.get("serviceTier"), None);
-    }
-
-    #[test]
-    fn thread_merge_params_serialize_camel_case_fields() {
-        let value = serde_json::to_value(ThreadMergeParams {
-            base_thread_id: "thread_base".to_string(),
-            merge_thread_ids: vec!["thread_a".to_string(), "thread_b".to_string()],
-            model: None,
-            model_provider: None,
-            service_tier: None,
-            cwd: None,
-            approval_policy: None,
-            sandbox: None,
-            config: None,
-            base_instructions: None,
-            developer_instructions: None,
-            ephemeral: false,
-        })
-        .expect("params should serialize");
-
-        assert_eq!(
-            value,
-            json!({
-                "approvalPolicy": null,
-                "baseInstructions": null,
-                "baseThreadId": "thread_base",
-                "config": null,
-                "cwd": null,
-                "developerInstructions": null,
-                "mergeThreadIds": ["thread_a", "thread_b"],
-                "model": null,
-                "modelProvider": null,
-                "sandbox": null
-            })
-        );
     }
 }

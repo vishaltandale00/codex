@@ -3083,10 +3083,6 @@ pub struct SessionConfiguredEvent {
     pub session_id: ThreadId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forked_from_id: Option<ThreadId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub merge_base_thread_id: Option<ThreadId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub merged_from_thread_ids: Vec<ThreadId>,
 
     /// Optional user-facing thread name (may be unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4389,8 +4385,6 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: conversation_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "codex-mini-latest".to_string(),
                 model_provider_id: "openai".to_string(),

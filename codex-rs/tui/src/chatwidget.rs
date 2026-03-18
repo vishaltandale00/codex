@@ -1393,8 +1393,6 @@ impl ChatWidget {
         let initial_messages = event.initial_messages.clone();
         self.last_copyable_output = None;
         let forked_from_id = event.forked_from_id;
-        let merge_base_thread_id = event.merge_base_thread_id;
-        let merged_from_thread_ids = event.merged_from_thread_ids.clone();
         let model_for_header = event.model.clone();
         self.session_header.set_model(&model_for_header);
         self.current_collaboration_mode = self.current_collaboration_mode.with_updates(
@@ -1440,11 +1438,7 @@ impl ChatWidget {
         if let Some(user_message) = self.initial_user_message.take() {
             self.submit_user_message(user_message);
         }
-        if let Some(merge_base_thread_id) = merge_base_thread_id
-            && !merged_from_thread_ids.is_empty()
-        {
-            self.emit_combined_thread_event(merge_base_thread_id, merged_from_thread_ids);
-        } else if let Some(forked_from_id) = forked_from_id {
+        if let Some(forked_from_id) = forked_from_id {
             self.emit_forked_thread_event(forked_from_id);
         }
         if !self.suppress_session_configured_redraw {
@@ -1465,7 +1459,7 @@ impl ChatWidget {
         });
     }
 
-    fn emit_combined_thread_event(
+    pub(crate) fn emit_combined_thread_event(
         &self,
         combine_base_thread_id: ThreadId,
         combined_from_thread_ids: Vec<ThreadId>,

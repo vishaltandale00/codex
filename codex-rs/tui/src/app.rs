@@ -60,7 +60,7 @@ use codex_core::models_manager::collaboration_mode_presets::CollaborationModesCo
 use codex_core::models_manager::manager::RefreshStrategy;
 use codex_core::models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
 use codex_core::models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
-use codex_core::paths_share_workspace;
+use codex_core::paths_match;
 use codex_core::resolve_recorded_thread_cwd;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
@@ -293,6 +293,7 @@ async fn collect_combine_picker_items(
     let mut cursor = None;
     let mut items = Vec::new();
     let mut page_count = 0usize;
+    let model_providers = [config.model_provider_id.clone()];
 
     loop {
         let page_started_at = Instant::now();
@@ -302,7 +303,7 @@ async fn collect_combine_picker_items(
             cursor.as_ref(),
             ThreadSortKey::UpdatedAt,
             INTERACTIVE_SESSION_SOURCES,
-            None,
+            Some(&model_providers),
             config.model_provider_id.as_str(),
             true,
             None,
@@ -327,7 +328,7 @@ async fn collect_combine_picker_items(
             let Some(candidate_cwd) = thread.cwd.as_ref() else {
                 continue;
             };
-            if !paths_share_workspace(candidate_cwd.as_path(), base_cwd.as_path()) {
+            if !paths_match(candidate_cwd.as_path(), base_cwd.as_path()) {
                 continue;
             }
             let name = thread
@@ -2623,12 +2624,8 @@ impl App {
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::OpenCombinePicker => {
-                let selection = crate::resume_picker::run_combine_picker_all_providers(
-                    tui,
-                    &self.config,
-                    false,
-                )
-                .await?;
+                let selection =
+                    crate::resume_picker::run_combine_picker(tui, &self.config, false).await?;
                 if Self::picker_requests_new_session(&selection) {
                     self.start_fresh_session_with_summary_hint(tui).await;
                     tui.frame_requester().schedule_frame();
@@ -2880,6 +2877,7 @@ impl App {
                     self.chat_widget.thread_id(),
                     self.chat_widget.thread_name(),
                 );
+                let combined_from_thread_ids = combine_thread_ids.clone();
                 let mut combine_sources = Vec::new();
                 for combine_thread_id in combine_thread_ids {
                     let Some(path) = codex_core::find_thread_path_by_id_str(
@@ -2919,6 +2917,8 @@ impl App {
                             combined.thread,
                             combined.session_configured,
                         );
+                        self.chat_widget
+                            .emit_combined_thread_event(base_thread_id, combined_from_thread_ids);
                         self.reset_thread_event_state();
                         if let Some(summary) = summary {
                             let mut lines: Vec<Line<'static>> =
@@ -4205,8 +4205,6 @@ impl App {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: config_snapshot.model,
                 model_provider_id: config_snapshot.model_provider_id,
@@ -4842,11 +4840,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_combine_picker_items_includes_cross_provider_threads() -> Result<()> {
+    async fn collect_combine_picker_items_filters_to_current_provider() -> Result<()> {
         let codex_home = tempdir()?;
         let workspace_cwd = codex_home.path().join("workspace");
         std::fs::create_dir_all(&workspace_cwd)?;
         let base_thread_id = ThreadId::new();
+        let same_provider_thread_id = ThreadId::new();
         let other_thread_id = ThreadId::new();
         write_combine_picker_rollout(
             codex_home.path(),
@@ -4855,6 +4854,15 @@ mod tests {
             None,
             workspace_cwd.as_path(),
             "base thread",
+            "primary-provider",
+        )?;
+        write_combine_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-00-30",
+            same_provider_thread_id,
+            None,
+            workspace_cwd.as_path(),
+            "same provider thread",
             "primary-provider",
         )?;
         write_combine_picker_rollout(
@@ -4879,8 +4887,8 @@ mod tests {
                 .await?;
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].thread_id, other_thread_id);
-        assert_eq!(items[0].display_name, "cross provider thread");
+        assert_eq!(items[0].thread_id, same_provider_thread_id);
+        assert_eq!(items[0].display_name, "same provider thread");
         let description = items[0]
             .description
             .as_deref()
@@ -4935,35 +4943,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_combine_picker_items_filters_by_workspace() -> Result<()> {
+    async fn collect_combine_picker_items_filters_by_exact_workspace() -> Result<()> {
         let codex_home = tempdir()?;
-        let repo_root = tempdir()?;
-        let other_repo_root = tempdir()?;
-        assert!(
-            std::process::Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(repo_root.path())
-                .status()?
-                .success()
-        );
-        assert!(
-            std::process::Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(other_repo_root.path())
-                .status()?
-                .success()
-        );
-
-        let base_cwd = repo_root.path().join("workspace-a");
-        let same_repo_cwd = repo_root.path().join("workspace-b");
-        let other_repo_cwd = other_repo_root.path().join("workspace-c");
+        let other_root = tempdir()?;
+        let base_cwd = codex_home.path().join("workspace-a");
+        let sibling_cwd = codex_home.path().join("workspace-b");
+        let other_repo_cwd = other_root.path().join("workspace-c");
         std::fs::create_dir_all(&base_cwd)?;
-        std::fs::create_dir_all(&same_repo_cwd)?;
+        std::fs::create_dir_all(&sibling_cwd)?;
         std::fs::create_dir_all(&other_repo_cwd)?;
 
         let base_thread_id = ThreadId::new();
         let same_cwd_thread_id = ThreadId::new();
-        let same_repo_thread_id = ThreadId::new();
+        let sibling_cwd_thread_id = ThreadId::new();
         let other_repo_thread_id = ThreadId::new();
 
         write_combine_picker_rollout(
@@ -4987,10 +4979,10 @@ mod tests {
         write_combine_picker_rollout(
             codex_home.path(),
             "2026-01-01T00-02-00",
-            same_repo_thread_id,
+            sibling_cwd_thread_id,
             None,
-            same_repo_cwd.as_path(),
-            "same repo thread",
+            sibling_cwd.as_path(),
+            "sibling cwd thread",
             "primary-provider",
         )?;
         write_combine_picker_rollout(
@@ -5016,9 +5008,9 @@ mod tests {
             .into_iter()
             .map(|item| item.thread_id)
             .collect::<Vec<_>>();
-        assert_eq!(ids.len(), 2);
+        assert_eq!(ids.len(), 1);
         assert!(ids.contains(&same_cwd_thread_id));
-        assert!(ids.contains(&same_repo_thread_id));
+        assert!(!ids.contains(&sibling_cwd_thread_id));
         assert!(!ids.contains(&other_repo_thread_id));
         Ok(())
     }
@@ -5149,8 +5141,6 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -5324,8 +5314,6 @@ mod tests {
                     msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                         session_id: thread_id,
                         forked_from_id: None,
-                        merge_base_thread_id: None,
-                        merged_from_thread_ids: Vec::new(),
                         thread_name: None,
                         model: "gpt-test".to_string(),
                         model_provider_id: "test-provider".to_string(),
@@ -5404,8 +5392,6 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -5488,8 +5474,6 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -5571,8 +5555,6 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -5648,8 +5630,6 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -5764,8 +5744,6 @@ mod tests {
                     msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                         session_id: thread_id,
                         forked_from_id: None,
-                        merge_base_thread_id: None,
-                        merged_from_thread_ids: Vec::new(),
                         thread_name: None,
                         model: "gpt-test".to_string(),
                         model_provider_id: "test-provider".to_string(),
@@ -5836,8 +5814,6 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -5942,8 +5918,6 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -6021,8 +5995,6 @@ mod tests {
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -6821,8 +6793,6 @@ guardian_approval = true
                     msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                         session_id: agent_thread_id,
                         forked_from_id: None,
-                        merge_base_thread_id: None,
-                        merged_from_thread_ids: Vec::new(),
                         thread_name: None,
                         model: "gpt-5".to_string(),
                         model_provider_id: "test-provider".to_string(),
@@ -7044,8 +7014,6 @@ guardian_approval = true
             let event = SessionConfiguredEvent {
                 session_id: ThreadId::new(),
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -7701,8 +7669,6 @@ guardian_approval = true
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: ThreadId::new(),
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -7819,8 +7785,6 @@ guardian_approval = true
             let event = SessionConfiguredEvent {
                 session_id: ThreadId::new(),
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -7881,8 +7845,6 @@ guardian_approval = true
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: base_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -7976,8 +7938,6 @@ guardian_approval = true
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -8044,8 +8004,6 @@ guardian_approval = true
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -8127,8 +8085,6 @@ guardian_approval = true
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: None,
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
@@ -8257,8 +8213,6 @@ guardian_approval = true
         let event = SessionConfiguredEvent {
             session_id: thread_id,
             forked_from_id: None,
-            merge_base_thread_id: None,
-            merged_from_thread_ids: Vec::new(),
             thread_name: None,
             model: "gpt-test".to_string(),
             model_provider_id: "test-provider".to_string(),
@@ -8329,8 +8283,6 @@ guardian_approval = true
             msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
                 session_id: thread_id,
                 forked_from_id: None,
-                merge_base_thread_id: None,
-                merged_from_thread_ids: Vec::new(),
                 thread_name: Some("keep me".to_string()),
                 model: "gpt-test".to_string(),
                 model_provider_id: "test-provider".to_string(),
