@@ -53,7 +53,6 @@ fn test_model_info(
         visibility: ModelVisibility::List,
         supported_in_api: true,
         input_modalities,
-        prefer_websockets: false,
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         priority: 1,
@@ -116,6 +115,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
         .submit(Op::OverrideTurnContext {
             cwd: None,
             approval_policy: None,
+            approvals_reviewer: None,
             sandbox_policy: None,
             windows_sandbox_level: None,
             model: Some(next_model.to_string()),
@@ -210,6 +210,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
         .submit(Op::OverrideTurnContext {
             cwd: None,
             approval_policy: None,
+            approvals_reviewer: None,
             sandbox_policy: None,
             windows_sandbox_level: None,
             model: Some(next_model.to_string()),
@@ -847,7 +848,6 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         visibility: ModelVisibility::List,
         supported_in_api: true,
         input_modalities: default_input_modalities(),
-        prefer_websockets: false,
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         priority: 1,
@@ -971,6 +971,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         .submit(Op::OverrideTurnContext {
             cwd: None,
             approval_policy: None,
+            approvals_reviewer: None,
             sandbox_policy: None,
             windows_sandbox_level: None,
             model: Some(smaller_model_slug.to_string()),

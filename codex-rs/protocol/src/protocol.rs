@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use crate::ThreadId;
 use crate::approvals::ElicitationRequestEvent;
+use crate::config_types::ApprovalsReviewer;
 use crate::config_types::CollaborationMode;
 use crate::config_types::ModeKind;
 use crate::config_types::Personality;
@@ -60,6 +61,9 @@ pub use crate::approvals::ElicitationAction;
 pub use crate::approvals::ExecApprovalRequestEvent;
 pub use crate::approvals::ExecApprovalRequestSkillMetadata;
 pub use crate::approvals::ExecPolicyAmendment;
+pub use crate::approvals::GuardianAssessmentEvent;
+pub use crate::approvals::GuardianAssessmentStatus;
+pub use crate::approvals::GuardianRiskLevel;
 pub use crate::approvals::NetworkApprovalContext;
 pub use crate::approvals::NetworkApprovalProtocol;
 pub use crate::approvals::NetworkPolicyAmendment;
@@ -80,6 +84,12 @@ pub const USER_INSTRUCTIONS_OPEN_TAG: &str = "<user_instructions>";
 pub const USER_INSTRUCTIONS_CLOSE_TAG: &str = "</user_instructions>";
 pub const ENVIRONMENT_CONTEXT_OPEN_TAG: &str = "<environment_context>";
 pub const ENVIRONMENT_CONTEXT_CLOSE_TAG: &str = "</environment_context>";
+pub const APPS_INSTRUCTIONS_OPEN_TAG: &str = "<apps_instructions>";
+pub const APPS_INSTRUCTIONS_CLOSE_TAG: &str = "</apps_instructions>";
+pub const SKILLS_INSTRUCTIONS_OPEN_TAG: &str = "<skills_instructions>";
+pub const SKILLS_INSTRUCTIONS_CLOSE_TAG: &str = "</skills_instructions>";
+pub const PLUGINS_INSTRUCTIONS_OPEN_TAG: &str = "<plugins_instructions>";
+pub const PLUGINS_INSTRUCTIONS_CLOSE_TAG: &str = "</plugins_instructions>";
 pub const COLLABORATION_MODE_OPEN_TAG: &str = "<collaboration_mode>";
 pub const COLLABORATION_MODE_CLOSE_TAG: &str = "</collaboration_mode>";
 pub const REALTIME_CONVERSATION_OPEN_TAG: &str = "<realtime_conversation>";
@@ -129,6 +139,8 @@ pub struct RealtimeAudioFrame {
     pub num_channels: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub samples_per_channel: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -151,14 +163,26 @@ pub struct RealtimeHandoffRequested {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct RealtimeInputAudioSpeechStarted {
+    pub item_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct RealtimeResponseCancelled {
+    pub response_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub enum RealtimeEvent {
     SessionUpdated {
         session_id: String,
         instructions: Option<String>,
     },
+    InputAudioSpeechStarted(RealtimeInputAudioSpeechStarted),
     InputTranscriptDelta(RealtimeTranscriptDelta),
     OutputTranscriptDelta(RealtimeTranscriptDelta),
     AudioOut(RealtimeAudioFrame),
+    ResponseCancelled(RealtimeResponseCancelled),
     ConversationItemAdded(Value),
     ConversationItemDone {
         item_id: String,
@@ -183,11 +207,12 @@ pub struct ConversationTextParams {
 #[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 pub enum Op {
-    /// Abort current task.
+    /// Abort current task without terminating background terminal processes.
     /// This server sends [`EventMsg::TurnAborted`] in response.
     Interrupt,
 
     /// Terminate all running background terminal processes for this thread.
+    /// Use this when callers intentionally want to stop long-lived background shells.
     CleanBackgroundTerminals,
 
     /// Start a realtime conversation stream.
@@ -280,6 +305,10 @@ pub enum Op {
         /// Updated command approval policy.
         #[serde(skip_serializing_if = "Option::is_none")]
         approval_policy: Option<AskForApproval>,
+
+        /// Updated approval reviewer for future approval prompts.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approvals_reviewer: Option<ApprovalsReviewer>,
 
         /// Updated sandbox policy for tool calls.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -423,16 +452,6 @@ pub enum Op {
         force_reload: bool,
     },
 
-    /// Request the list of remote skills available via ChatGPT sharing.
-    ListRemoteSkills {
-        hazelnut_scope: RemoteSkillHazelnutScope,
-        product_surface: RemoteSkillProductSurface,
-        enabled: Option<bool>,
-    },
-
-    /// Download a remote skill by id into the local skills cache.
-    DownloadRemoteSkill { hazelnut_id: String },
-
     /// Request the agent to summarize the current conversation context.
     /// The agent will use its existing context (either conversation history or previous response id)
     /// to generate a summary which will be returned as an AgentMessage event.
@@ -476,6 +495,45 @@ pub enum Op {
 
     /// Request the list of available models.
     ListModels,
+}
+
+impl Op {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Interrupt => "interrupt",
+            Self::CleanBackgroundTerminals => "clean_background_terminals",
+            Self::RealtimeConversationStart(_) => "realtime_conversation_start",
+            Self::RealtimeConversationAudio(_) => "realtime_conversation_audio",
+            Self::RealtimeConversationText(_) => "realtime_conversation_text",
+            Self::RealtimeConversationClose => "realtime_conversation_close",
+            Self::UserInput { .. } => "user_input",
+            Self::UserTurn { .. } => "user_turn",
+            Self::OverrideTurnContext { .. } => "override_turn_context",
+            Self::ExecApproval { .. } => "exec_approval",
+            Self::PatchApproval { .. } => "patch_approval",
+            Self::ResolveElicitation { .. } => "resolve_elicitation",
+            Self::UserInputAnswer { .. } => "user_input_answer",
+            Self::RequestPermissionsResponse { .. } => "request_permissions_response",
+            Self::DynamicToolResponse { .. } => "dynamic_tool_response",
+            Self::AddToHistory { .. } => "add_to_history",
+            Self::GetHistoryEntryRequest { .. } => "get_history_entry_request",
+            Self::ListMcpTools => "list_mcp_tools",
+            Self::RefreshMcpServers { .. } => "refresh_mcp_servers",
+            Self::ReloadUserConfig => "reload_user_config",
+            Self::ListCustomPrompts => "list_custom_prompts",
+            Self::ListSkills { .. } => "list_skills",
+            Self::Compact => "compact",
+            Self::DropMemories => "drop_memories",
+            Self::UpdateMemories => "update_memories",
+            Self::SetThreadName { .. } => "set_thread_name",
+            Self::Undo => "undo",
+            Self::ThreadRollback { .. } => "thread_rollback",
+            Self::Review { .. } => "review",
+            Self::Shutdown => "shutdown",
+            Self::RunUserShellCommand { .. } => "run_user_shell_command",
+            Self::ListModels => "list_models",
+        }
+    }
 }
 
 /// Determines the conditions under which the user is consulted to approve
@@ -1191,6 +1249,9 @@ pub enum EventMsg {
 
     ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent),
 
+    /// Structured lifecycle event for a guardian-reviewed approval request.
+    GuardianAssessment(GuardianAssessmentEvent),
+
     /// Notification advising the user that something they are using has been
     /// deprecated and should be phased out.
     DeprecationNotice(DeprecationNoticeEvent),
@@ -1225,12 +1286,6 @@ pub enum EventMsg {
 
     /// List of skills available to the agent.
     ListSkillsResponse(ListSkillsResponseEvent),
-
-    /// List of remote skills available to the agent.
-    ListRemoteSkillsResponse(ListRemoteSkillsResponseEvent),
-
-    /// Remote skill downloaded to local cache.
-    RemoteSkillDownloaded(RemoteSkillDownloadedEvent),
 
     /// Notification that skill data may have been updated and clients may want to reload.
     SkillsUpdateAvailable,
@@ -1286,6 +1341,7 @@ pub enum EventMsg {
 #[serde(rename_all = "snake_case")]
 pub enum HookEventName {
     SessionStart,
+    UserPromptSubmit,
     Stop,
 }
 
@@ -1373,9 +1429,18 @@ pub struct HookCompletedEvent {
     pub run: HookRunSummary,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeConversationVersion {
+    #[default]
+    V1,
+    V2,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 pub struct RealtimeConversationStartedEvent {
     pub session_id: Option<String>,
+    pub version: RealtimeConversationVersion,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -1459,6 +1524,8 @@ pub enum AgentStatus {
     PendingInit,
     /// Agent is currently running.
     Running,
+    /// Agent's current turn was interrupted and it may receive more input.
+    Interrupted,
     /// Agent is done. Contains the final assistant message.
     Completed(Option<String>),
     /// Agent encountered an error.
@@ -2911,47 +2978,17 @@ pub struct ListSkillsResponseEvent {
     pub skills: Vec<SkillsListEntry>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
-pub struct RemoteSkillSummary {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
-#[serde(rename_all = "kebab-case")]
-#[ts(rename_all = "kebab-case")]
-pub enum RemoteSkillHazelnutScope {
-    WorkspaceShared,
-    AllShared,
-    Personal,
-    Example,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "lowercase")]
 #[ts(rename_all = "lowercase")]
-pub enum RemoteSkillProductSurface {
+pub enum Product {
+    #[serde(alias = "CHATGPT")]
     Chatgpt,
+    #[serde(alias = "CODEX")]
     Codex,
-    Api,
+    #[serde(alias = "ATLAS")]
     Atlas,
 }
-
-/// Response payload for `Op::ListRemoteSkills`.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
-pub struct ListRemoteSkillsResponseEvent {
-    pub skills: Vec<RemoteSkillSummary>,
-}
-
-/// Response payload for `Op::DownloadRemoteSkill`.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
-pub struct RemoteSkillDownloadedEvent {
-    pub id: String,
-    pub name: String,
-    pub path: PathBuf,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(rename_all = "snake_case")]
@@ -3066,6 +3103,12 @@ pub struct SessionConfiguredEvent {
 
     /// When to escalate for approval for execution
     pub approval_policy: AskForApproval,
+
+    /// Configures who approval requests are routed to for review once they have
+    /// been escalated. This does not disable separate safety checks such as
+    /// ARC.
+    #[serde(default)]
+    pub approvals_reviewer: ApprovalsReviewer,
 
     /// How to sandbox commands executed in the system
     pub sandbox_policy: SandboxPolicy,
@@ -3255,9 +3298,9 @@ pub struct CollabAgentSpawnEndEvent {
     /// Initial prompt sent to the agent. Can be empty to prevent CoT leaking at the
     /// beginning.
     pub prompt: String,
-    /// Model requested for the spawned agent.
+    /// Effective model used by the spawned agent after inheritance and role overrides.
     pub model: String,
-    /// Reasoning effort requested for the spawned agent.
+    /// Effective reasoning effort used by the spawned agent after inheritance and role overrides.
     pub reasoning_effort: ReasoningEffortConfig,
     /// Last known status of the new agent reported to the sender agent.
     pub status: AgentStatus,
@@ -3725,9 +3768,9 @@ mod tests {
     #[test]
     fn restricted_file_system_policy_treats_root_with_carveouts_as_scoped_access() {
         let cwd = TempDir::new().expect("tempdir");
-        let cwd_absolute =
-            AbsolutePathBuf::from_absolute_path(cwd.path()).expect("absolute tempdir");
-        let root = cwd_absolute
+        let canonical_cwd = cwd.path().canonicalize().expect("canonicalize cwd");
+        let root = AbsolutePathBuf::from_absolute_path(&canonical_cwd)
+            .expect("absolute canonical tempdir")
             .as_path()
             .ancestors()
             .last()
@@ -3735,6 +3778,13 @@ mod tests {
             .expect("filesystem root");
         let blocked = AbsolutePathBuf::resolve_path_against_base("blocked", cwd.path())
             .expect("resolve blocked");
+        let expected_blocked = AbsolutePathBuf::from_absolute_path(
+            cwd.path()
+                .canonicalize()
+                .expect("canonicalize cwd")
+                .join("blocked"),
+        )
+        .expect("canonical blocked");
         let policy = FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
@@ -3743,9 +3793,7 @@ mod tests {
                 access: FileSystemAccessMode::Write,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: blocked.clone(),
-                },
+                path: FileSystemPath::Path { path: blocked },
                 access: FileSystemAccessMode::None,
             },
         ]);
@@ -3758,7 +3806,7 @@ mod tests {
         );
         assert_eq!(
             policy.get_unreadable_roots_with_cwd(cwd.path()),
-            vec![blocked.clone()]
+            vec![expected_blocked.clone()]
         );
 
         let writable_roots = policy.get_writable_roots_with_cwd(cwd.path());
@@ -3768,7 +3816,7 @@ mod tests {
             writable_roots[0]
                 .read_only_subpaths
                 .iter()
-                .any(|path| path.as_path() == blocked.as_path())
+                .any(|path| path.as_path() == expected_blocked.as_path())
         );
     }
 
@@ -3777,14 +3825,17 @@ mod tests {
         let cwd = TempDir::new().expect("tempdir");
         std::fs::create_dir_all(cwd.path().join(".agents")).expect("create .agents");
         std::fs::create_dir_all(cwd.path().join(".codex")).expect("create .codex");
+        let canonical_cwd = cwd.path().canonicalize().expect("canonicalize cwd");
         let cwd_absolute =
-            AbsolutePathBuf::from_absolute_path(cwd.path()).expect("absolute tempdir");
+            AbsolutePathBuf::from_absolute_path(&canonical_cwd).expect("absolute tempdir");
         let secret = AbsolutePathBuf::resolve_path_against_base("secret", cwd.path())
             .expect("resolve unreadable path");
-        let agents = AbsolutePathBuf::resolve_path_against_base(".agents", cwd.path())
-            .expect("resolve .agents");
-        let codex = AbsolutePathBuf::resolve_path_against_base(".codex", cwd.path())
-            .expect("resolve .codex");
+        let expected_secret = AbsolutePathBuf::from_absolute_path(canonical_cwd.join("secret"))
+            .expect("canonical secret");
+        let expected_agents = AbsolutePathBuf::from_absolute_path(canonical_cwd.join(".agents"))
+            .expect("canonical .agents");
+        let expected_codex = AbsolutePathBuf::from_absolute_path(canonical_cwd.join(".codex"))
+            .expect("canonical .codex");
         let policy = FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
@@ -3799,9 +3850,7 @@ mod tests {
                 access: FileSystemAccessMode::Write,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: secret.clone(),
-                },
+                path: FileSystemPath::Path { path: secret },
                 access: FileSystemAccessMode::None,
             },
         ]);
@@ -3811,43 +3860,49 @@ mod tests {
         assert!(policy.include_platform_defaults());
         assert_eq!(
             policy.get_readable_roots_with_cwd(cwd.path()),
-            vec![cwd_absolute]
+            vec![cwd_absolute.clone()]
         );
         assert_eq!(
             policy.get_unreadable_roots_with_cwd(cwd.path()),
-            vec![secret.clone()]
+            vec![expected_secret.clone()]
         );
 
         let writable_roots = policy.get_writable_roots_with_cwd(cwd.path());
         assert_eq!(writable_roots.len(), 1);
-        assert_eq!(writable_roots[0].root.as_path(), cwd.path());
+        assert_eq!(writable_roots[0].root, cwd_absolute);
         assert!(
             writable_roots[0]
                 .read_only_subpaths
                 .iter()
-                .any(|path| path.as_path() == secret.as_path())
+                .any(|path| path.as_path() == expected_secret.as_path())
         );
         assert!(
             writable_roots[0]
                 .read_only_subpaths
                 .iter()
-                .any(|path| path.as_path() == agents.as_path())
+                .any(|path| path.as_path() == expected_agents.as_path())
         );
         assert!(
             writable_roots[0]
                 .read_only_subpaths
                 .iter()
-                .any(|path| path.as_path() == codex.as_path())
+                .any(|path| path.as_path() == expected_codex.as_path())
         );
     }
 
     #[test]
     fn restricted_file_system_policy_treats_read_entries_as_read_only_subpaths() {
         let cwd = TempDir::new().expect("tempdir");
+        let canonical_cwd = cwd.path().canonicalize().expect("canonicalize cwd");
         let docs =
             AbsolutePathBuf::resolve_path_against_base("docs", cwd.path()).expect("resolve docs");
         let docs_public = AbsolutePathBuf::resolve_path_against_base("docs/public", cwd.path())
             .expect("resolve docs/public");
+        let expected_docs = AbsolutePathBuf::from_absolute_path(canonical_cwd.join("docs"))
+            .expect("canonical docs");
+        let expected_docs_public =
+            AbsolutePathBuf::from_absolute_path(canonical_cwd.join("docs/public"))
+                .expect("canonical docs/public");
         let policy = FileSystemSandboxPolicy::restricted(vec![
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
@@ -3856,13 +3911,11 @@ mod tests {
                 access: FileSystemAccessMode::Write,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path { path: docs.clone() },
+                path: FileSystemPath::Path { path: docs },
                 access: FileSystemAccessMode::Read,
             },
             FileSystemSandboxEntry {
-                path: FileSystemPath::Path {
-                    path: docs_public.clone(),
-                },
+                path: FileSystemPath::Path { path: docs_public },
                 access: FileSystemAccessMode::Write,
             },
         ]);
@@ -3871,8 +3924,8 @@ mod tests {
         assert_eq!(
             sorted_writable_roots(policy.get_writable_roots_with_cwd(cwd.path())),
             vec![
-                (cwd.path().to_path_buf(), vec![docs.to_path_buf()]),
-                (docs_public.to_path_buf(), Vec::new()),
+                (canonical_cwd, vec![expected_docs.to_path_buf()]),
+                (expected_docs_public.to_path_buf(), Vec::new()),
             ]
         );
     }
@@ -3882,6 +3935,7 @@ mod tests {
         let cwd = TempDir::new().expect("tempdir");
         let docs =
             AbsolutePathBuf::resolve_path_against_base("docs", cwd.path()).expect("resolve docs");
+        let canonical_cwd = cwd.path().canonicalize().expect("canonicalize cwd");
         let policy = SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![],
             read_only_access: ReadOnlyAccess::Restricted {
@@ -3898,7 +3952,7 @@ mod tests {
                 FileSystemSandboxPolicy::from_legacy_sandbox_policy(&policy, cwd.path())
                     .get_writable_roots_with_cwd(cwd.path())
             ),
-            vec![(cwd.path().to_path_buf(), Vec::new())]
+            vec![(canonical_cwd, Vec::new())]
         );
     }
 
@@ -4108,6 +4162,7 @@ mod tests {
                 sample_rate: 24_000,
                 num_channels: 1,
                 samples_per_channel: Some(480),
+                item_id: None,
             },
         });
         let start = Op::RealtimeConversationStart(ConversationStartParams {
@@ -4341,6 +4396,7 @@ mod tests {
                 model_provider_id: "openai".to_string(),
                 service_tier: None,
                 approval_policy: AskForApproval::Never,
+                approvals_reviewer: ApprovalsReviewer::User,
                 sandbox_policy: SandboxPolicy::new_read_only_policy(),
                 cwd: PathBuf::from("/home/user/project"),
                 reasoning_effort: Some(ReasoningEffortConfig::default()),
@@ -4360,6 +4416,7 @@ mod tests {
                 "model": "codex-mini-latest",
                 "model_provider_id": "openai",
                 "approval_policy": "never",
+                "approvals_reviewer": "user",
                 "sandbox_policy": {
                     "type": "read-only"
                 },

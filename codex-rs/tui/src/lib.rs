@@ -24,6 +24,7 @@ use codex_core::config::load_config_as_toml_with_cli_overrides;
 use codex_core::config::resolve_oss_provider;
 use codex_core::config_loader::CloudRequirementsLoader;
 use codex_core::config_loader::ConfigLoadError;
+use codex_core::config_loader::LoaderOverrides;
 use codex_core::config_loader::format_config_error_with_source;
 use codex_core::default_client::set_default_client_residency_requirement;
 use codex_core::find_thread_path_by_id_str;
@@ -62,9 +63,23 @@ mod app;
 mod app_backtrack;
 mod app_event;
 mod app_event_sender;
+mod app_server_tui_dispatch;
 mod ascii_animation;
 #[cfg(all(not(target_os = "linux"), feature = "voice-input"))]
 mod audio_device;
+#[cfg(all(not(target_os = "linux"), not(feature = "voice-input")))]
+mod audio_device {
+    use crate::app_event::RealtimeAudioDeviceKind;
+
+    pub(crate) fn list_realtime_audio_device_names(
+        kind: RealtimeAudioDeviceKind,
+    ) -> Result<Vec<String>, String> {
+        Err(format!(
+            "Failed to load realtime {} devices: voice input is unavailable in this build",
+            kind.noun()
+        ))
+    }
+}
 mod bottom_pane;
 mod chatwidget;
 mod cli;
@@ -131,6 +146,7 @@ mod voice {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU16;
+    use std::sync::atomic::AtomicUsize;
 
     pub struct RecordedAudio {
         pub data: Vec<i16>,
@@ -144,12 +160,24 @@ mod voice {
 
     pub(crate) struct RealtimeAudioPlayer;
 
+    #[derive(Clone)]
+    pub(crate) enum RealtimeInputBehavior {
+        Ungated,
+        PlaybackAware {
+            playback_queued_samples: Arc<AtomicUsize>,
+        },
+    }
+
     impl VoiceCapture {
         pub fn start() -> Result<Self, String> {
             Err("voice input is unavailable in this build".to_string())
         }
 
-        pub fn start_realtime(_config: &Config, _tx: AppEventSender) -> Result<Self, String> {
+        pub fn start_realtime(
+            _config: &Config,
+            _tx: AppEventSender,
+            _input_behavior: RealtimeInputBehavior,
+        ) -> Result<Self, String> {
             Err("voice input is unavailable in this build".to_string())
         }
 
@@ -189,7 +217,10 @@ mod voice {
     }
 
     impl RealtimeAudioPlayer {
-        pub(crate) fn start(_config: &Config) -> Result<Self, String> {
+        pub(crate) fn start(
+            _config: &Config,
+            _queued_samples: Arc<AtomicUsize>,
+        ) -> Result<Self, String> {
             Err("voice output is unavailable in this build".to_string())
         }
 
@@ -212,6 +243,7 @@ mod voice {
         });
     }
 }
+
 mod wrapping;
 
 #[cfg(test)]
@@ -220,6 +252,7 @@ pub mod test_backend;
 use crate::onboarding::onboarding_screen::OnboardingScreenArgs;
 use crate::onboarding::onboarding_screen::run_onboarding_app;
 use crate::tui::Tui;
+pub use app_server_tui_dispatch::should_use_app_server_tui;
 pub use cli::Cli;
 use codex_arg0::Arg0DispatchPaths;
 pub use markdown_render::render_markdown_text;
@@ -227,7 +260,11 @@ pub use public_widgets::composer_input::ComposerAction;
 pub use public_widgets::composer_input::ComposerInput;
 // (tests access modules directly within the crate)
 
-pub async fn run_main(mut cli: Cli, arg0_paths: Arg0DispatchPaths) -> std::io::Result<AppExitInfo> {
+pub async fn run_main(
+    mut cli: Cli,
+    arg0_paths: Arg0DispatchPaths,
+    _loader_overrides: LoaderOverrides,
+) -> std::io::Result<AppExitInfo> {
     let (sandbox_mode, approval_policy) = if cli.full_auto {
         (
             Some(SandboxMode::WorkspaceWrite),
@@ -318,7 +355,7 @@ pub async fn run_main(mut cli: Cli, arg0_paths: Arg0DispatchPaths) -> std::io::R
 
     let cloud_auth_manager = AuthManager::shared(
         codex_home.to_path_buf(),
-        false,
+        /*enable_codex_api_key_env*/ false,
         config_toml.cli_auth_credentials_store.unwrap_or_default(),
     );
     let chatgpt_base_url = config_toml
@@ -481,7 +518,12 @@ pub async fn run_main(mut cli: Cli, arg0_paths: Arg0DispatchPaths) -> std::io::R
     }
 
     let otel = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        codex_core::otel_init::build_provider(&config, env!("CARGO_PKG_VERSION"), None, true)
+        codex_core::otel_init::build_provider(
+            &config,
+            env!("CARGO_PKG_VERSION"),
+            /*service_name_override*/ None,
+            /*default_analytics_enabled*/ true,
+        )
     })) {
         Ok(Ok(otel)) => otel,
         Ok(Err(e)) => {
@@ -529,6 +571,7 @@ pub async fn run_main(mut cli: Cli, arg0_paths: Arg0DispatchPaths) -> std::io::R
     .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_ratatui_app(
     cli: Cli,
     initial_config: Config,
@@ -582,7 +625,7 @@ async fn run_ratatui_app(
 
     let auth_manager = AuthManager::shared(
         initial_config.codex_home.clone(),
-        false,
+        /*enable_codex_api_key_env*/ false,
         initial_config.cli_auth_credentials_store_mode,
     );
     let login_status = get_login_status(&initial_config);
@@ -689,20 +732,25 @@ async fn run_ratatui_app(
             let provider_filter = vec![config.model_provider_id.clone()];
             match RolloutRecorder::list_threads(
                 &config,
-                1,
-                None,
+                /*page_size*/ 1,
+                /*cursor*/ None,
                 ThreadSortKey::UpdatedAt,
                 INTERACTIVE_SESSION_SOURCES,
                 Some(provider_filter.as_slice()),
                 &config.model_provider_id,
-                false,
-                None,
+                /*include_empty_threads*/ false,
+                /*search_term*/ None,
             )
             .await
             {
                 Ok(page) => match page.items.first() {
                     Some(item) => {
-                        match resolve_session_thread_id(item.path.as_path(), None).await {
+                        match resolve_session_thread_id(
+                            item.path.as_path(),
+                            /*id_str_if_uuid*/ None,
+                        )
+                        .await
+                        {
                             Some(thread_id) => resume_picker::SessionSelection::Fork(
                                 resume_picker::SessionTarget {
                                     path: item.path.clone(),
@@ -785,8 +833,8 @@ async fn run_ratatui_app(
         };
         match RolloutRecorder::find_latest_thread_path(
             &config,
-            1,
-            None,
+            /*page_size*/ 1,
+            /*cursor*/ None,
             ThreadSortKey::UpdatedAt,
             INTERACTIVE_SESSION_SOURCES,
             Some(provider_filter.as_slice()),
@@ -795,30 +843,34 @@ async fn run_ratatui_app(
         )
         .await
         {
-            Ok(Some(path)) => match resolve_session_thread_id(path.as_path(), None).await {
-                Some(thread_id) => {
-                    resume_picker::SessionSelection::Resume(resume_picker::SessionTarget {
-                        path,
-                        thread_id,
-                    })
+            Ok(Some(path)) => {
+                match resolve_session_thread_id(path.as_path(), /*id_str_if_uuid*/ None).await {
+                    Some(thread_id) => {
+                        resume_picker::SessionSelection::Resume(resume_picker::SessionTarget {
+                            path,
+                            thread_id,
+                        })
+                    }
+                    None => {
+                        let rollout_path = path.display();
+                        error!(
+                            "Error reading session metadata from latest rollout: {rollout_path}"
+                        );
+                        restore();
+                        session_log::log_session_end();
+                        let _ = tui.terminal.clear();
+                        return Ok(AppExitInfo {
+                            token_usage: codex_protocol::protocol::TokenUsage::default(),
+                            thread_id: None,
+                            thread_name: None,
+                            update_action: None,
+                            exit_reason: ExitReason::Fatal(format!(
+                                "Found latest saved session at {rollout_path}, but failed to read its metadata. Run `codex resume` to choose from existing sessions."
+                            )),
+                        });
+                    }
                 }
-                None => {
-                    let rollout_path = path.display();
-                    error!("Error reading session metadata from latest rollout: {rollout_path}");
-                    restore();
-                    session_log::log_session_end();
-                    let _ = tui.terminal.clear();
-                    return Ok(AppExitInfo {
-                        token_usage: codex_protocol::protocol::TokenUsage::default(),
-                        thread_id: None,
-                        thread_name: None,
-                        update_action: None,
-                        exit_reason: ExitReason::Fatal(format!(
-                            "Found latest saved session at {rollout_path}, but failed to read its metadata. Run `codex resume` to choose from existing sessions."
-                        )),
-                    });
-                }
-            },
+            }
             _ => resume_picker::SessionSelection::StartFresh,
         }
     } else if cli.resume_picker {
@@ -1122,8 +1174,13 @@ async fn load_config_or_exit(
     overrides: ConfigOverrides,
     cloud_requirements: CloudRequirementsLoader,
 ) -> Config {
-    load_config_or_exit_with_fallback_cwd(cli_kv_overrides, overrides, cloud_requirements, None)
-        .await
+    load_config_or_exit_with_fallback_cwd(
+        cli_kv_overrides,
+        overrides,
+        cloud_requirements,
+        /*fallback_cwd*/ None,
+    )
+    .await
 }
 
 async fn load_config_or_exit_with_fallback_cwd(
@@ -1183,7 +1240,6 @@ mod tests {
     use codex_core::config::ConfigOverrides;
     use codex_core::config::ProjectConfig;
     use codex_core::features::Feature;
-    use codex_protocol::ThreadId;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::RolloutItem;
     use codex_protocol::protocol::RolloutLine;
@@ -1191,6 +1247,7 @@ mod tests {
     use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::TurnContextItem;
+    use pretty_assertions::assert_eq;
     use serial_test::serial;
     use tempfile::TempDir;
 
@@ -1216,6 +1273,7 @@ mod tests {
         );
         Ok(())
     }
+
     #[tokio::test]
     #[serial]
     async fn windows_shows_trust_prompt_with_sandbox() -> std::io::Result<()> {

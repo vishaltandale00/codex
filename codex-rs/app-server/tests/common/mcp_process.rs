@@ -25,6 +25,13 @@ use codex_app_server_protocol::ConfigReadParams;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ExperimentalFeatureListParams;
 use codex_app_server_protocol::FeedbackUploadParams;
+use codex_app_server_protocol::FsCopyParams;
+use codex_app_server_protocol::FsCreateDirectoryParams;
+use codex_app_server_protocol::FsGetMetadataParams;
+use codex_app_server_protocol::FsReadDirectoryParams;
+use codex_app_server_protocol::FsReadFileParams;
+use codex_app_server_protocol::FsRemoveParams;
+use codex_app_server_protocol::FsWriteFileParams;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAuthStatusParams;
 use codex_app_server_protocol::GetConversationSummaryParams;
@@ -261,7 +268,8 @@ impl McpProcess {
 
     /// Send an `account/rateLimits/read` JSON-RPC request.
     pub async fn send_get_account_rate_limits_request(&mut self) -> anyhow::Result<i64> {
-        self.send_request("account/rateLimits/read", None).await
+        self.send_request("account/rateLimits/read", /*params*/ None)
+            .await
     }
 
     /// Send an `account/read` JSON-RPC request.
@@ -719,9 +727,59 @@ impl McpProcess {
         self.send_request("config/batchWrite", params).await
     }
 
+    pub async fn send_fs_read_file_request(
+        &mut self,
+        params: FsReadFileParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/readFile", params).await
+    }
+
+    pub async fn send_fs_write_file_request(
+        &mut self,
+        params: FsWriteFileParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/writeFile", params).await
+    }
+
+    pub async fn send_fs_create_directory_request(
+        &mut self,
+        params: FsCreateDirectoryParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/createDirectory", params).await
+    }
+
+    pub async fn send_fs_get_metadata_request(
+        &mut self,
+        params: FsGetMetadataParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/getMetadata", params).await
+    }
+
+    pub async fn send_fs_read_directory_request(
+        &mut self,
+        params: FsReadDirectoryParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/readDirectory", params).await
+    }
+
+    pub async fn send_fs_remove_request(&mut self, params: FsRemoveParams) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/remove", params).await
+    }
+
+    pub async fn send_fs_copy_request(&mut self, params: FsCopyParams) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/copy", params).await
+    }
+
     /// Send an `account/logout` JSON-RPC request.
     pub async fn send_logout_account_request(&mut self) -> anyhow::Result<i64> {
-        self.send_request("account/logout", None).await
+        self.send_request("account/logout", /*params*/ None).await
     }
 
     /// Send an `account/login/start` JSON-RPC request for API key login.
@@ -995,6 +1053,31 @@ impl McpProcess {
         Ok(notification)
     }
 
+    pub async fn read_stream_until_matching_notification<F>(
+        &mut self,
+        description: &str,
+        predicate: F,
+    ) -> anyhow::Result<JSONRPCNotification>
+    where
+        F: Fn(&JSONRPCNotification) -> bool,
+    {
+        eprintln!("in read_stream_until_matching_notification({description})");
+
+        let message = self
+            .read_stream_until_message(|message| {
+                matches!(
+                    message,
+                    JSONRPCMessage::Notification(notification) if predicate(notification)
+                )
+            })
+            .await?;
+
+        let JSONRPCMessage::Notification(notification) = message else {
+            unreachable!("expected JSONRPCMessage::Notification, got {message:?}");
+        };
+        Ok(notification)
+    }
+
     pub async fn read_next_message(&mut self) -> anyhow::Result<JSONRPCMessage> {
         self.read_stream_until_message(|_| true).await
     }
@@ -1005,6 +1088,16 @@ impl McpProcess {
     /// messages buffered from the prior turn.
     pub fn clear_message_buffer(&mut self) {
         self.pending_messages.clear();
+    }
+
+    pub fn pending_notification_methods(&self) -> Vec<String> {
+        self.pending_messages
+            .iter()
+            .filter_map(|message| match message {
+                JSONRPCMessage::Notification(notification) => Some(notification.method.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Reads the stream until a message matches `predicate`, buffering any non-matching messages

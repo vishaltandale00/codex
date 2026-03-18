@@ -64,7 +64,6 @@ use codex_app_server_protocol::GetConversationSummaryParams;
 use codex_app_server_protocol::GetConversationSummaryResponse;
 use codex_app_server_protocol::GitDiffToRemoteResponse;
 use codex_app_server_protocol::GitInfo as ApiGitInfo;
-use codex_app_server_protocol::HazelnutScope as ApiHazelnutScope;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::ListMcpServerStatusParams;
 use codex_app_server_protocol::ListMcpServerStatusResponse;
@@ -72,6 +71,7 @@ use codex_app_server_protocol::LoginAccountParams;
 use codex_app_server_protocol::LoginAccountResponse;
 use codex_app_server_protocol::LoginApiKeyParams;
 use codex_app_server_protocol::LogoutAccountResponse;
+use codex_app_server_protocol::MarketplaceInterface;
 use codex_app_server_protocol::McpServerOauthLoginCompletedNotification;
 use codex_app_server_protocol::McpServerOauthLoginParams;
 use codex_app_server_protocol::McpServerOauthLoginResponse;
@@ -94,7 +94,6 @@ use codex_app_server_protocol::PluginSource;
 use codex_app_server_protocol::PluginSummary;
 use codex_app_server_protocol::PluginUninstallParams;
 use codex_app_server_protocol::PluginUninstallResponse;
-use codex_app_server_protocol::ProductSurface as ApiProductSurface;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewDelivery as ApiReviewDelivery;
 use codex_app_server_protocol::ReviewStartParams;
@@ -108,10 +107,6 @@ use codex_app_server_protocol::SkillsConfigWriteParams;
 use codex_app_server_protocol::SkillsConfigWriteResponse;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
-use codex_app_server_protocol::SkillsRemoteReadParams;
-use codex_app_server_protocol::SkillsRemoteReadResponse;
-use codex_app_server_protocol::SkillsRemoteWriteParams;
-use codex_app_server_protocol::SkillsRemoteWriteResponse;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadArchiveResponse;
@@ -230,7 +225,7 @@ use codex_core::models_manager::collaboration_mode_presets::CollaborationModesCo
 use codex_core::parse_cursor;
 use codex_core::paths_share_workspace;
 use codex_core::plugins::MarketplaceError;
-use codex_core::plugins::MarketplacePluginSourceSummary;
+use codex_core::plugins::MarketplacePluginSource;
 use codex_core::plugins::PluginInstallError as CorePluginInstallError;
 use codex_core::plugins::PluginInstallRequest;
 use codex_core::plugins::PluginReadRequest;
@@ -240,8 +235,6 @@ use codex_core::read_head_for_summary;
 use codex_core::resolve_recorded_thread_cwd;
 use codex_core::rollout_date_parts;
 use codex_core::sandboxing::SandboxPermissions;
-use codex_core::skills::remote::export_remote_skill;
-use codex_core::skills::remote::list_remote_skills;
 use codex_core::state_db::StateDbHandle;
 use codex_core::state_db::get_state_db;
 use codex_core::state_db::reconcile_rollout;
@@ -271,8 +264,6 @@ use codex_protocol::protocol::McpAuthStatus as CoreMcpAuthStatus;
 use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RateLimitSnapshot as CoreRateLimitSnapshot;
-use codex_protocol::protocol::RemoteSkillHazelnutScope;
-use codex_protocol::protocol::RemoteSkillProductSurface;
 use codex_protocol::protocol::ReviewDelivery as CoreReviewDelivery;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget as CoreReviewTarget;
@@ -363,24 +354,6 @@ enum ThreadShutdownResult {
     TimedOut,
 }
 
-fn convert_remote_scope(scope: ApiHazelnutScope) -> RemoteSkillHazelnutScope {
-    match scope {
-        ApiHazelnutScope::WorkspaceShared => RemoteSkillHazelnutScope::WorkspaceShared,
-        ApiHazelnutScope::AllShared => RemoteSkillHazelnutScope::AllShared,
-        ApiHazelnutScope::Personal => RemoteSkillHazelnutScope::Personal,
-        ApiHazelnutScope::Example => RemoteSkillHazelnutScope::Example,
-    }
-}
-
-fn convert_remote_product_surface(product_surface: ApiProductSurface) -> RemoteSkillProductSurface {
-    match product_surface {
-        ApiProductSurface::Chatgpt => RemoteSkillProductSurface::Chatgpt,
-        ApiProductSurface::Codex => RemoteSkillProductSurface::Codex,
-        ApiProductSurface::Api => RemoteSkillProductSurface::Api,
-        ApiProductSurface::Atlas => RemoteSkillProductSurface::Atlas,
-    }
-}
-
 impl Drop for ActiveLogin {
     fn drop(&mut self) {
         self.shutdown_handle.shutdown();
@@ -451,7 +424,7 @@ impl CodexMessageProcessor {
     }
 
     pub(crate) async fn maybe_start_curated_repo_sync_for_latest_config(&self) {
-        match self.load_latest_config(None).await {
+        match self.load_latest_config(/*fallback_cwd*/ None).await {
             Ok(config) => self
                 .thread_manager
                 .plugins_manager()
@@ -738,14 +711,6 @@ impl CodexMessageProcessor {
                 self.plugin_read(to_connection_request_id(request_id), params)
                     .await;
             }
-            ClientRequest::SkillsRemoteList { request_id, params } => {
-                self.skills_remote_list(to_connection_request_id(request_id), params)
-                    .await;
-            }
-            ClientRequest::SkillsRemoteExport { request_id, params } => {
-                self.skills_remote_export(to_connection_request_id(request_id), params)
-                    .await;
-            }
             ClientRequest::AppsList { request_id, params } => {
                 self.apps_list(to_connection_request_id(request_id), params)
                     .await;
@@ -907,6 +872,15 @@ impl CodexMessageProcessor {
             | ClientRequest::ConfigValueWrite { .. }
             | ClientRequest::ConfigBatchWrite { .. } => {
                 warn!("Config request reached CodexMessageProcessor unexpectedly");
+            }
+            ClientRequest::FsReadFile { .. }
+            | ClientRequest::FsWriteFile { .. }
+            | ClientRequest::FsCreateDirectory { .. }
+            | ClientRequest::FsGetMetadata { .. }
+            | ClientRequest::FsReadDirectory { .. }
+            | ClientRequest::FsRemove { .. }
+            | ClientRequest::FsCopy { .. } => {
+                warn!("Filesystem request reached CodexMessageProcessor unexpectedly");
             }
             ClientRequest::ConfigRequirementsRead { .. } => {
                 warn!("ConfigRequirementsRead request reached CodexMessageProcessor unexpectedly");
@@ -1623,7 +1597,10 @@ impl CodexMessageProcessor {
         }
 
         let cwd = cwd.unwrap_or_else(|| self.config.cwd.clone());
-        let mut env = create_env(&self.config.permissions.shell_environment_policy, None);
+        let mut env = create_env(
+            &self.config.permissions.shell_environment_policy,
+            /*thread_id*/ None,
+        );
         if let Some(env_overrides) = env_overrides {
             for (key, value) in env_overrides {
                 match value {
@@ -1659,8 +1636,8 @@ impl CodexMessageProcessor {
             Some(spec) => match spec
                 .start_proxy(
                     self.config.permissions.sandbox_policy.get(),
-                    None,
-                    None,
+                    /*policy_decider*/ None,
+                    /*blocked_request_observer*/ None,
                     managed_network_requirements_enabled,
                     NetworkProxyAuditMetadata::default(),
                 )
@@ -1854,6 +1831,7 @@ impl CodexMessageProcessor {
             service_tier,
             cwd,
             approval_policy,
+            approvals_reviewer,
             sandbox,
             config,
             service_name,
@@ -1872,6 +1850,7 @@ impl CodexMessageProcessor {
             service_tier,
             cwd,
             approval_policy,
+            approvals_reviewer,
             sandbox,
             base_instructions,
             developer_instructions,
@@ -1917,6 +1896,10 @@ impl CodexMessageProcessor {
         {
             warn!("timed out waiting for background tasks to shut down; proceeding");
         }
+    }
+
+    pub(crate) async fn clear_all_thread_listeners(&self) {
+        self.thread_state_manager.clear_all_listeners().await;
     }
 
     pub(crate) async fn shutdown_threads(&self) {
@@ -1969,6 +1952,7 @@ impl CodexMessageProcessor {
             config_overrides,
             typesafe_overrides,
             &cloud_requirements,
+            &listener_task_context.codex_home,
         )
         .await
         {
@@ -2005,9 +1989,11 @@ impl CodexMessageProcessor {
                     name: tool.name,
                     description: tool.description,
                     input_schema: tool.input_schema,
+                    defer_loading: tool.defer_loading,
                 })
                 .collect()
         };
+        let core_dynamic_tool_count = core_dynamic_tools.len();
 
         match listener_task_context
             .thread_manager
@@ -2018,6 +2004,12 @@ impl CodexMessageProcessor {
                 service_name,
                 request_trace,
             )
+            .instrument(tracing::info_span!(
+                "app_server.thread_start.create_thread",
+                otel.name = "app_server.thread_start.create_thread",
+                thread_start.dynamic_tool_count = core_dynamic_tool_count,
+                thread_start.persist_extended_history = persist_extended_history,
+            ))
             .await
         {
             Ok(new_conv) => {
@@ -2027,7 +2019,13 @@ impl CodexMessageProcessor {
                     session_configured,
                     ..
                 } = new_conv;
-                let config_snapshot = thread.config_snapshot().await;
+                let config_snapshot = thread
+                    .config_snapshot()
+                    .instrument(tracing::info_span!(
+                        "app_server.thread_start.config_snapshot",
+                        otel.name = "app_server.thread_start.config_snapshot",
+                    ))
+                    .await;
                 let mut thread = build_thread_from_snapshot(
                     thread_id,
                     &config_snapshot,
@@ -2043,6 +2041,11 @@ impl CodexMessageProcessor {
                         experimental_raw_events,
                         ApiVersion::V2,
                     )
+                    .instrument(tracing::info_span!(
+                        "app_server.thread_start.attach_listener",
+                        otel.name = "app_server.thread_start.attach_listener",
+                        thread_start.experimental_raw_events = experimental_raw_events,
+                    ))
                     .await,
                     thread_id,
                     request_id.connection_id,
@@ -2052,14 +2055,22 @@ impl CodexMessageProcessor {
                 listener_task_context
                     .thread_watch_manager
                     .upsert_thread_silently(thread.clone())
+                    .instrument(tracing::info_span!(
+                        "app_server.thread_start.upsert_thread",
+                        otel.name = "app_server.thread_start.upsert_thread",
+                    ))
                     .await;
 
                 thread.status = resolve_thread_status(
                     listener_task_context
                         .thread_watch_manager
                         .loaded_status_for_thread(&thread.id)
+                        .instrument(tracing::info_span!(
+                            "app_server.thread_start.resolve_status",
+                            otel.name = "app_server.thread_start.resolve_status",
+                        ))
                         .await,
-                    false,
+                    /*has_in_progress_turn*/ false,
                 );
 
                 let response = ThreadStartResponse {
@@ -2069,6 +2080,7 @@ impl CodexMessageProcessor {
                     service_tier: config_snapshot.service_tier,
                     cwd: config_snapshot.cwd,
                     approval_policy: config_snapshot.approval_policy.into(),
+                    approvals_reviewer: config_snapshot.approvals_reviewer.into(),
                     sandbox: config_snapshot.sandbox_policy.into(),
                     reasoning_effort: config_snapshot.reasoning_effort,
                 };
@@ -2076,12 +2088,20 @@ impl CodexMessageProcessor {
                 listener_task_context
                     .outgoing
                     .send_response(request_id, response)
+                    .instrument(tracing::info_span!(
+                        "app_server.thread_start.send_response",
+                        otel.name = "app_server.thread_start.send_response",
+                    ))
                     .await;
 
                 let notif = ThreadStartedNotification { thread };
                 listener_task_context
                     .outgoing
                     .send_server_notification(ServerNotification::ThreadStarted(notif))
+                    .instrument(tracing::info_span!(
+                        "app_server.thread_start.notify_started",
+                        otel.name = "app_server.thread_start.notify_started",
+                    ))
                     .await;
             }
             Err(err) => {
@@ -2106,6 +2126,7 @@ impl CodexMessageProcessor {
         service_tier: Option<Option<codex_protocol::config_types::ServiceTier>>,
         cwd: Option<String>,
         approval_policy: Option<codex_app_server_protocol::AskForApproval>,
+        approvals_reviewer: Option<codex_app_server_protocol::ApprovalsReviewer>,
         sandbox: Option<SandboxMode>,
         base_instructions: Option<String>,
         developer_instructions: Option<String>,
@@ -2118,6 +2139,8 @@ impl CodexMessageProcessor {
             cwd: cwd.map(PathBuf::from),
             approval_policy: approval_policy
                 .map(codex_app_server_protocol::AskForApproval::to_core),
+            approvals_reviewer: approvals_reviewer
+                .map(codex_app_server_protocol::ApprovalsReviewer::to_core),
             sandbox_mode: sandbox.map(SandboxMode::to_core),
             codex_linux_sandbox_exe: self.arg0_paths.codex_linux_sandbox_exe.clone(),
             main_execve_wrapper_exe: self.arg0_paths.main_execve_wrapper_exe.clone(),
@@ -2496,7 +2519,7 @@ impl CodexMessageProcessor {
             self.thread_watch_manager
                 .loaded_status_for_thread(&thread.id)
                 .await,
-            false,
+            /*has_in_progress_turn*/ false,
         );
 
         self.outgoing
@@ -2547,10 +2570,10 @@ impl CodexMessageProcessor {
                 Some(state_db_ctx),
                 rollout_path.as_path(),
                 self.config.model_provider_id.as_str(),
-                None,
+                /*builder*/ None,
                 &[],
-                None,
-                None,
+                /*archived_only*/ None,
+                /*new_thread_memory_mode*/ None,
             )
             .await;
 
@@ -2618,10 +2641,10 @@ impl CodexMessageProcessor {
             Some(state_db_ctx),
             rollout_path.as_path(),
             self.config.model_provider_id.as_str(),
-            None,
+            /*builder*/ None,
             &[],
-            None,
-            None,
+            /*archived_only*/ None,
+            /*new_thread_memory_mode*/ None,
         )
         .await;
 
@@ -2808,7 +2831,7 @@ impl CodexMessageProcessor {
                     self.thread_watch_manager
                         .loaded_status_for_thread(&thread.id)
                         .await,
-                    false,
+                    /*has_in_progress_turn*/ false,
                 );
                 self.attach_thread_name(thread_id, &mut thread).await;
                 let thread_id = thread.id.clone();
@@ -3282,8 +3305,13 @@ impl CodexMessageProcessor {
 
         for connection_id in connection_ids {
             Self::log_listener_attach_result(
-                self.ensure_conversation_listener(thread_id, connection_id, false, ApiVersion::V2)
-                    .await,
+                self.ensure_conversation_listener(
+                    thread_id,
+                    connection_id,
+                    /*raw_events_enabled*/ false,
+                    ApiVersion::V2,
+                )
+                .await,
                 thread_id,
                 connection_id,
                 "thread",
@@ -3325,6 +3353,7 @@ impl CodexMessageProcessor {
             service_tier,
             cwd,
             approval_policy,
+            approvals_reviewer,
             sandbox,
             config: request_overrides,
             base_instructions,
@@ -3358,6 +3387,7 @@ impl CodexMessageProcessor {
             service_tier,
             cwd,
             approval_policy,
+            approvals_reviewer,
             sandbox,
             base_instructions,
             developer_instructions,
@@ -3372,6 +3402,7 @@ impl CodexMessageProcessor {
             typesafe_overrides,
             history_cwd,
             &cloud_requirements,
+            &self.config.codex_home,
         )
         .await
         {
@@ -3416,7 +3447,7 @@ impl CodexMessageProcessor {
                     self.ensure_conversation_listener(
                         thread_id,
                         request_id.connection_id,
-                        false,
+                        /*raw_events_enabled*/ false,
                         ApiVersion::V2,
                     )
                     .await,
@@ -3448,7 +3479,11 @@ impl CodexMessageProcessor {
                     .loaded_status_for_thread(&thread.id)
                     .await;
 
-                set_thread_status_and_interrupt_stale_turns(&mut thread, thread_status, false);
+                set_thread_status_and_interrupt_stale_turns(
+                    &mut thread,
+                    thread_status,
+                    /*has_live_in_progress_turn*/ false,
+                );
 
                 let response = ThreadResumeResponse {
                     thread,
@@ -3457,6 +3492,7 @@ impl CodexMessageProcessor {
                     service_tier: session_configured.service_tier,
                     cwd: session_configured.cwd,
                     approval_policy: session_configured.approval_policy.into(),
+                    approvals_reviewer: session_configured.approvals_reviewer.into(),
                     sandbox: session_configured.sandbox_policy.into(),
                     reasoning_effort: session_configured.reasoning_effort,
                 };
@@ -3765,7 +3801,7 @@ impl CodexMessageProcessor {
         if let Err(message) = populate_thread_turns(
             &mut thread,
             ThreadTurnSource::HistoryItems(&history_items),
-            None,
+            /*active_turn*/ None,
         )
         .await
         {
@@ -3796,6 +3832,7 @@ impl CodexMessageProcessor {
             service_tier,
             cwd,
             approval_policy,
+            approvals_reviewer,
             sandbox,
             config: cli_overrides,
             base_instructions,
@@ -3877,10 +3914,11 @@ impl CodexMessageProcessor {
             service_tier,
             cwd,
             approval_policy,
+            approvals_reviewer,
             sandbox,
             base_instructions,
             developer_instructions,
-            None,
+            /*personality*/ None,
         );
         typesafe_overrides.ephemeral = ephemeral.then_some(true);
         // Derive a Config using the same logic as new conversation, honoring overrides if provided.
@@ -3891,6 +3929,7 @@ impl CodexMessageProcessor {
             typesafe_overrides,
             history_cwd,
             &cloud_requirements,
+            &self.config.codex_home,
         )
         .await
         {
@@ -3951,7 +3990,7 @@ impl CodexMessageProcessor {
             self.ensure_conversation_listener(
                 thread_id,
                 request_id.connection_id,
-                false,
+                /*raw_events_enabled*/ false,
                 ApiVersion::V2,
             )
             .await,
@@ -3985,7 +4024,8 @@ impl CodexMessageProcessor {
         } else {
             let config_snapshot = forked_thread.config_snapshot().await;
             // forked thread names do not inherit the source thread name
-            let mut thread = build_thread_from_snapshot(thread_id, &config_snapshot, None);
+            let mut thread =
+                build_thread_from_snapshot(thread_id, &config_snapshot, /*path*/ None);
             let history_items = match read_rollout_items_from_rollout(rollout_path.as_path()).await
             {
                 Ok(items) => items,
@@ -4005,7 +4045,7 @@ impl CodexMessageProcessor {
             if let Err(message) = populate_thread_turns(
                 &mut thread,
                 ThreadTurnSource::HistoryItems(&history_items),
-                None,
+                /*active_turn*/ None,
             )
             .await
             {
@@ -4019,7 +4059,7 @@ impl CodexMessageProcessor {
             && let Err(message) = populate_thread_turns(
                 &mut thread,
                 ThreadTurnSource::RolloutPath(fork_rollout_path.as_path()),
-                None,
+                /*active_turn*/ None,
             )
             .await
         {
@@ -4035,7 +4075,7 @@ impl CodexMessageProcessor {
             self.thread_watch_manager
                 .loaded_status_for_thread(&thread.id)
                 .await,
-            false,
+            /*has_in_progress_turn*/ false,
         );
 
         let response = ThreadForkResponse {
@@ -4045,6 +4085,7 @@ impl CodexMessageProcessor {
             service_tier: session_configured.service_tier,
             cwd: session_configured.cwd,
             approval_policy: session_configured.approval_policy.into(),
+            approvals_reviewer: session_configured.approvals_reviewer.into(),
             sandbox: session_configured.sandbox_policy.into(),
             reasoning_effort: session_configured.reasoning_effort,
         };
@@ -4242,10 +4283,11 @@ impl CodexMessageProcessor {
             service_tier,
             cwd,
             approval_policy,
+            /*approvals_reviewer*/ None,
             sandbox,
             base_instructions,
             developer_instructions,
-            None,
+            /*personality*/ None,
         );
         typesafe_overrides.ephemeral = ephemeral.then_some(true);
         let cloud_requirements = self.current_cloud_requirements();
@@ -4255,6 +4297,7 @@ impl CodexMessageProcessor {
             typesafe_overrides,
             history_cwd,
             &cloud_requirements,
+            &self.config.codex_home,
         )
         .await
         {
@@ -4699,7 +4742,7 @@ impl CodexMessageProcessor {
         params: ExperimentalFeatureListParams,
     ) {
         let ExperimentalFeatureListParams { cursor, limit } = params;
-        let config = match self.load_latest_config(None).await {
+        let config = match self.load_latest_config(/*fallback_cwd*/ None).await {
             Ok(config) => config,
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
@@ -4814,7 +4857,7 @@ impl CodexMessageProcessor {
     }
 
     async fn mcp_server_refresh(&self, request_id: ConnectionRequestId, _params: Option<()>) {
-        let config = match self.load_latest_config(None).await {
+        let config = match self.load_latest_config(/*fallback_cwd*/ None).await {
             Ok(config) => config,
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
@@ -4873,7 +4916,7 @@ impl CodexMessageProcessor {
         request_id: ConnectionRequestId,
         params: McpServerOauthLoginParams,
     ) {
-        let config = match self.load_latest_config(None).await {
+        let config = match self.load_latest_config(/*fallback_cwd*/ None).await {
             Ok(config) => config,
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
@@ -4985,7 +5028,7 @@ impl CodexMessageProcessor {
         let request = request_id.clone();
 
         let outgoing = Arc::clone(&self.outgoing);
-        let config = match self.load_latest_config(None).await {
+        let config = match self.load_latest_config(/*fallback_cwd*/ None).await {
             Ok(config) => config,
             Err(error) => {
                 self.outgoing.send_error(request, error).await;
@@ -5157,7 +5200,7 @@ impl CodexMessageProcessor {
     async fn finalize_thread_teardown(&mut self, thread_id: ThreadId) {
         self.pending_thread_unloads.lock().await.remove(&thread_id);
         self.outgoing
-            .cancel_requests_for_thread(thread_id, None)
+            .cancel_requests_for_thread(thread_id, /*error*/ None)
             .await;
         self.thread_state_manager
             .remove_thread_state(thread_id)
@@ -5220,7 +5263,7 @@ impl CodexMessageProcessor {
             // Any pending app-server -> client requests for this thread can no longer be
             // answered; cancel their callbacks before shutdown/unload.
             self.outgoing
-                .cancel_requests_for_thread(thread_id, None)
+                .cancel_requests_for_thread(thread_id, /*error*/ None)
                 .await;
             self.thread_state_manager
                 .remove_thread_state(thread_id)
@@ -5393,7 +5436,7 @@ impl CodexMessageProcessor {
     }
 
     async fn apps_list(&self, request_id: ConnectionRequestId, params: AppsListParams) {
-        let mut config = match self.load_latest_config(None).await {
+        let mut config = match self.load_latest_config(/*fallback_cwd*/ None).await {
             Ok(config) => config,
             Err(error) => {
                 self.outgoing.send_error(request_id, error).await;
@@ -5690,7 +5733,7 @@ impl CodexMessageProcessor {
         } = params;
         let roots = cwds.unwrap_or_default();
 
-        let mut config = match self.load_latest_config(None).await {
+        let mut config = match self.load_latest_config(/*fallback_cwd*/ None).await {
             Ok(config) => config,
             Err(err) => {
                 self.outgoing.send_error(request_id, err).await;
@@ -5723,7 +5766,7 @@ impl CodexMessageProcessor {
                 }
             }
 
-            config = match self.load_latest_config(None).await {
+            config = match self.load_latest_config(/*fallback_cwd*/ None).await {
                 Ok(config) => config,
                 Err(err) => {
                     self.outgoing.send_error(request_id, err).await;
@@ -5740,6 +5783,9 @@ impl CodexMessageProcessor {
                     .map(|marketplace| PluginMarketplaceEntry {
                         name: marketplace.name,
                         path: marketplace.path,
+                        interface: marketplace.interface.map(|interface| MarketplaceInterface {
+                            display_name: interface.display_name,
+                        }),
                         plugins: marketplace
                             .plugins
                             .into_iter()
@@ -5749,8 +5795,8 @@ impl CodexMessageProcessor {
                                 enabled: plugin.enabled,
                                 name: plugin.name,
                                 source: marketplace_plugin_source_to_info(plugin.source),
-                                install_policy: plugin.install_policy.into(),
-                                auth_policy: plugin.auth_policy.into(),
+                                install_policy: plugin.policy.installation.into(),
+                                auth_policy: plugin.policy.authentication.into(),
                                 interface: plugin.interface.map(plugin_interface_to_info),
                             })
                             .collect(),
@@ -5839,8 +5885,8 @@ impl CodexMessageProcessor {
                 source: marketplace_plugin_source_to_info(outcome.plugin.source),
                 installed: outcome.plugin.installed,
                 enabled: outcome.plugin.enabled,
-                install_policy: outcome.plugin.install_policy.into(),
-                auth_policy: outcome.plugin.auth_policy.into(),
+                install_policy: outcome.plugin.policy.installation.into(),
+                auth_policy: outcome.plugin.policy.authentication.into(),
                 interface: outcome.plugin.interface.map(plugin_interface_to_info),
             },
             description: outcome.plugin.description,
@@ -5852,79 +5898,6 @@ impl CodexMessageProcessor {
         self.outgoing
             .send_response(request_id, PluginReadResponse { plugin })
             .await;
-    }
-
-    async fn skills_remote_list(
-        &self,
-        request_id: ConnectionRequestId,
-        params: SkillsRemoteReadParams,
-    ) {
-        let hazelnut_scope = convert_remote_scope(params.hazelnut_scope);
-        let product_surface = convert_remote_product_surface(params.product_surface);
-        let enabled = if params.enabled { Some(true) } else { None };
-
-        let auth = self.auth_manager.auth().await;
-        match list_remote_skills(
-            &self.config,
-            auth.as_ref(),
-            hazelnut_scope,
-            product_surface,
-            enabled,
-        )
-        .await
-        {
-            Ok(skills) => {
-                let data = skills
-                    .into_iter()
-                    .map(|skill| codex_app_server_protocol::RemoteSkillSummary {
-                        id: skill.id,
-                        name: skill.name,
-                        description: skill.description,
-                    })
-                    .collect();
-                self.outgoing
-                    .send_response(request_id, SkillsRemoteReadResponse { data })
-                    .await;
-            }
-            Err(err) => {
-                self.send_internal_error(
-                    request_id,
-                    format!("failed to list remote skills: {err}"),
-                )
-                .await;
-            }
-        }
-    }
-
-    async fn skills_remote_export(
-        &self,
-        request_id: ConnectionRequestId,
-        params: SkillsRemoteWriteParams,
-    ) {
-        let SkillsRemoteWriteParams { hazelnut_id } = params;
-        let auth = self.auth_manager.auth().await;
-        let response = export_remote_skill(&self.config, auth.as_ref(), hazelnut_id.as_str()).await;
-
-        match response {
-            Ok(downloaded) => {
-                self.outgoing
-                    .send_response(
-                        request_id,
-                        SkillsRemoteWriteResponse {
-                            id: downloaded.id,
-                            path: downloaded.path,
-                        },
-                    )
-                    .await;
-            }
-            Err(err) => {
-                self.send_internal_error(
-                    request_id,
-                    format!("failed to download remote skill: {err}"),
-                )
-                .await;
-            }
-        }
     }
 
     async fn skills_config_write(
@@ -5966,6 +5939,7 @@ impl CodexMessageProcessor {
         let PluginInstallParams {
             marketplace_path,
             plugin_name,
+            force_remote_sync,
         } = params;
         let config_cwd = marketplace_path.as_path().parent().map(Path::to_path_buf);
 
@@ -5975,7 +5949,23 @@ impl CodexMessageProcessor {
             marketplace_path,
         };
 
-        match plugins_manager.install_plugin(request).await {
+        let install_result = if force_remote_sync {
+            let config = match self.load_latest_config(config_cwd.clone()).await {
+                Ok(config) => config,
+                Err(err) => {
+                    self.outgoing.send_error(request_id, err).await;
+                    return;
+                }
+            };
+            let auth = self.auth_manager.auth().await;
+            plugins_manager
+                .install_plugin_with_remote_sync(&config, auth.as_ref(), request)
+                .await
+        } else {
+            plugins_manager.install_plugin(request).await
+        };
+
+        match install_result {
             Ok(result) => {
                 let config = match self.load_latest_config(config_cwd).await {
                     Ok(config) => config,
@@ -5993,9 +5983,9 @@ impl CodexMessageProcessor {
                     Vec::new()
                 } else {
                     let (all_connectors_result, accessible_connectors_result) = tokio::join!(
-                        connectors::list_all_connectors_with_options(&config, true),
+                        connectors::list_all_connectors_with_options(&config, /*force_refetch*/ true),
                         connectors::list_accessible_connectors_from_mcp_tools_with_options_and_status(
-                            &config, true
+                            &config, /*force_refetch*/ true
                         ),
                     );
 
@@ -6076,6 +6066,13 @@ impl CodexMessageProcessor {
                         )
                         .await;
                     }
+                    CorePluginInstallError::Remote(err) => {
+                        self.send_internal_error(
+                            request_id,
+                            format!("failed to enable remote plugin: {err}"),
+                        )
+                        .await;
+                    }
                     CorePluginInstallError::Join(err) => {
                         self.send_internal_error(
                             request_id,
@@ -6100,9 +6097,29 @@ impl CodexMessageProcessor {
         request_id: ConnectionRequestId,
         params: PluginUninstallParams,
     ) {
+        let PluginUninstallParams {
+            plugin_id,
+            force_remote_sync,
+        } = params;
         let plugins_manager = self.thread_manager.plugins_manager();
 
-        match plugins_manager.uninstall_plugin(params.plugin_id).await {
+        let uninstall_result = if force_remote_sync {
+            let config = match self.load_latest_config(/*fallback_cwd*/ None).await {
+                Ok(config) => config,
+                Err(err) => {
+                    self.outgoing.send_error(request_id, err).await;
+                    return;
+                }
+            };
+            let auth = self.auth_manager.auth().await;
+            plugins_manager
+                .uninstall_plugin_with_remote_sync(&config, auth.as_ref(), plugin_id)
+                .await
+        } else {
+            plugins_manager.uninstall_plugin(plugin_id).await
+        };
+
+        match uninstall_result {
             Ok(()) => {
                 self.clear_plugin_related_caches();
                 self.outgoing
@@ -6121,6 +6138,13 @@ impl CodexMessageProcessor {
                         self.send_internal_error(
                             request_id,
                             format!("failed to clear plugin config: {err}"),
+                        )
+                        .await;
+                    }
+                    CorePluginUninstallError::Remote(err) => {
+                        self.send_internal_error(
+                            request_id,
+                            format!("failed to uninstall remote plugin: {err}"),
                         )
                         .await;
                     }
@@ -6186,6 +6210,7 @@ impl CodexMessageProcessor {
 
         let has_any_overrides = params.cwd.is_some()
             || params.approval_policy.is_some()
+            || params.approvals_reviewer.is_some()
             || params.sandbox_policy.is_some()
             || params.model.is_some()
             || params.service_tier.is_some()
@@ -6203,6 +6228,9 @@ impl CodexMessageProcessor {
                     Op::OverrideTurnContext {
                         cwd: params.cwd,
                         approval_policy: params.approval_policy.map(AskForApproval::to_core),
+                        approvals_reviewer: params
+                            .approvals_reviewer
+                            .map(codex_app_server_protocol::ApprovalsReviewer::to_core),
                         sandbox_policy: params.sandbox_policy.map(|p| p.to_core()),
                         windows_sandbox_level: None,
                         model: params.model,
@@ -6343,7 +6371,7 @@ impl CodexMessageProcessor {
             .ensure_conversation_listener(
                 thread_id,
                 request_id.connection_id,
-                false,
+                /*raw_events_enabled*/ false,
                 ApiVersion::V2,
             )
             .await
@@ -6624,7 +6652,7 @@ impl CodexMessageProcessor {
                 usize::MAX,
                 config,
                 rollout_path,
-                false,
+                /*persist_extended_history*/ false,
                 self.request_trace_context(request_id).await,
             )
             .await
@@ -6638,7 +6666,7 @@ impl CodexMessageProcessor {
             self.ensure_conversation_listener(
                 thread_id,
                 request_id.connection_id,
-                false,
+                /*raw_events_enabled*/ false,
                 ApiVersion::V2,
             )
             .await,
@@ -6659,7 +6687,7 @@ impl CodexMessageProcessor {
                         self.thread_watch_manager
                             .loaded_status_for_thread(&thread.id)
                             .await,
-                        false,
+                        /*has_in_progress_turn*/ false,
                     );
                     let notif = ThreadStartedNotification { thread };
                     self.outgoing
@@ -7347,13 +7375,14 @@ impl CodexMessageProcessor {
         tokio::spawn(async move {
             let derived_config = derive_config_for_cwd(
                 &cli_overrides,
-                None,
+                /*request_overrides*/ None,
                 ConfigOverrides {
                     cwd: Some(command_cwd.clone()),
                     ..Default::default()
                 },
                 Some(command_cwd.clone()),
                 &cloud_requirements,
+                &config.codex_home,
             )
             .await;
             let setup_result = match derived_config {
@@ -7509,6 +7538,7 @@ async fn handle_pending_thread_resume_request(
         model_provider_id,
         service_tier,
         approval_policy,
+        approvals_reviewer,
         sandbox_policy,
         cwd,
         reasoning_effort,
@@ -7521,6 +7551,7 @@ async fn handle_pending_thread_resume_request(
         service_tier,
         cwd,
         approval_policy: approval_policy.into(),
+        approvals_reviewer: approvals_reviewer.into(),
         sandbox: sandbox_policy.into(),
         reasoning_effort,
     };
@@ -7659,6 +7690,15 @@ fn collect_resume_override_mismatches(
             ));
         }
     }
+    if let Some(requested_review_policy) = request.approvals_reviewer.as_ref() {
+        let active_review_policy: codex_app_server_protocol::ApprovalsReviewer =
+            config_snapshot.approvals_reviewer.into();
+        if requested_review_policy != &active_review_policy {
+            mismatch_details.push(format!(
+                "approvals_reviewer requested={requested_review_policy:?} active={active_review_policy:?}"
+            ));
+        }
+    }
     if let Some(requested_sandbox) = request.sandbox.as_ref() {
         let sandbox_matches = matches!(
             (requested_sandbox, &config_snapshot.sandbox_policy),
@@ -7783,7 +7823,7 @@ fn plugin_skills_to_info(skills: &[codex_core::skills::SkillMetadata]) -> Vec<Sk
 }
 
 fn plugin_interface_to_info(
-    interface: codex_core::plugins::PluginManifestInterfaceSummary,
+    interface: codex_core::plugins::PluginManifestInterface,
 ) -> PluginInterface {
     PluginInterface {
         display_name: interface.display_name,
@@ -7803,9 +7843,9 @@ fn plugin_interface_to_info(
     }
 }
 
-fn marketplace_plugin_source_to_info(source: MarketplacePluginSourceSummary) -> PluginSource {
+fn marketplace_plugin_source_to_info(source: MarketplacePluginSource) -> PluginSource {
     match source {
-        MarketplacePluginSourceSummary::Local { path } => PluginSource::Local { path },
+        MarketplacePluginSource::Local { path } => PluginSource::Local { path },
     }
 }
 
@@ -7937,6 +7977,7 @@ async fn derive_config_from_params(
     request_overrides: Option<HashMap<String, serde_json::Value>>,
     typesafe_overrides: ConfigOverrides,
     cloud_requirements: &CloudRequirementsLoader,
+    codex_home: &Path,
 ) -> std::io::Result<Config> {
     let merged_cli_overrides = cli_overrides
         .iter()
@@ -7950,6 +7991,7 @@ async fn derive_config_from_params(
         .collect::<Vec<_>>();
 
     codex_core::config::ConfigBuilder::default()
+        .codex_home(codex_home.to_path_buf())
         .cli_overrides(merged_cli_overrides)
         .harness_overrides(typesafe_overrides)
         .cloud_requirements(cloud_requirements.clone())
@@ -7963,6 +8005,7 @@ async fn derive_config_for_cwd(
     typesafe_overrides: ConfigOverrides,
     cwd: Option<PathBuf>,
     cloud_requirements: &CloudRequirementsLoader,
+    codex_home: &Path,
 ) -> std::io::Result<Config> {
     let merged_cli_overrides = cli_overrides
         .iter()
@@ -7976,6 +8019,7 @@ async fn derive_config_for_cwd(
         .collect::<Vec<_>>();
 
     codex_core::config::ConfigBuilder::default()
+        .codex_home(codex_home.to_path_buf())
         .cli_overrides(merged_cli_overrides)
         .harness_overrides(typesafe_overrides)
         .fallback_cwd(cwd)
@@ -8454,6 +8498,7 @@ mod tests {
             name: "my_tool".to_string(),
             description: "test".to_string(),
             input_schema: json!({"type": "null"}),
+            defer_loading: false,
         }];
         let err = validate_dynamic_tools(&tools).expect_err("invalid schema");
         assert!(err.contains("my_tool"), "unexpected error: {err}");
@@ -8466,6 +8511,7 @@ mod tests {
             description: "test".to_string(),
             // Missing `type` is common; core sanitizes these to a supported schema.
             input_schema: json!({"properties": {}}),
+            defer_loading: false,
         }];
         validate_dynamic_tools(&tools).expect("valid schema");
     }
@@ -8542,6 +8588,7 @@ mod tests {
             service_tier: Some(Some(codex_protocol::config_types::ServiceTier::Fast)),
             cwd: None,
             approval_policy: None,
+            approvals_reviewer: None,
             sandbox: None,
             config: None,
             base_instructions: None,
@@ -8554,6 +8601,7 @@ mod tests {
             model_provider_id: "openai".to_string(),
             service_tier: Some(codex_protocol::config_types::ServiceTier::Flex),
             approval_policy: codex_protocol::protocol::AskForApproval::OnRequest,
+            approvals_reviewer: codex_protocol::config_types::ApprovalsReviewer::User,
             sandbox_policy: codex_protocol::protocol::SandboxPolicy::DangerFullAccess,
             cwd: PathBuf::from("/tmp"),
             ephemeral: false,

@@ -55,6 +55,17 @@ function codeModeWorkerMain() {
     return JSON.parse(JSON.stringify(value));
   }
 
+  class CodeModeExitSignal extends Error {
+    constructor() {
+      super('code mode exit');
+      this.name = 'CodeModeExitSignal';
+    }
+  }
+
+  function isCodeModeExitSignal(error) {
+    return error instanceof CodeModeExitSignal;
+  }
+
   function createToolCaller() {
     let nextId = 0;
     const pending = new Map();
@@ -257,8 +268,12 @@ function codeModeWorkerMain() {
     const yieldControl = () => {
       parentPort.postMessage({ type: 'yield' });
     };
+    const exit = () => {
+      throw new CodeModeExitSignal();
+    };
 
     return Object.freeze({
+      exit,
       image,
       load,
       output_image: image,
@@ -271,8 +286,18 @@ function codeModeWorkerMain() {
 
   function createCodeModeModule(context, helpers) {
     return new SyntheticModule(
-      ['image', 'load', 'output_text', 'output_image', 'store', 'text', 'yield_control'],
+      [
+        'exit',
+        'image',
+        'load',
+        'output_text',
+        'output_image',
+        'store',
+        'text',
+        'yield_control',
+      ],
       function initCodeModeModule() {
+        this.setExport('exit', helpers.exit);
         this.setExport('image', helpers.image);
         this.setExport('load', helpers.load);
         this.setExport('output_text', helpers.output_text);
@@ -288,6 +313,7 @@ function codeModeWorkerMain() {
   function createBridgeRuntime(callTool, enabledTools, helpers) {
     return Object.freeze({
       ALL_TOOLS: createAllToolsMetadata(enabledTools),
+      exit: helpers.exit,
       image: helpers.image,
       load: helpers.load,
       store: helpers.store,
@@ -439,6 +465,7 @@ function codeModeWorkerMain() {
       writable: false,
     });
 
+    parentPort.postMessage({ type: 'started' });
     try {
       await runModule(context, start, callTool, helpers);
       parentPort.postMessage({
@@ -446,6 +473,13 @@ function codeModeWorkerMain() {
         stored_values: state.storedValues,
       });
     } catch (error) {
+      if (isCodeModeExitSignal(error)) {
+        parentPort.postMessage({
+          type: 'result',
+          stored_values: state.storedValues,
+        });
+        return;
+      }
       parentPort.postMessage({
         type: 'result',
         stored_values: state.storedValues,
@@ -606,6 +640,10 @@ function startSession(protocol, sessions, start) {
     content_items: [],
     default_yield_time_ms: normalizeYieldTime(start.default_yield_time_ms),
     id: start.cell_id,
+    initial_yield_time_ms:
+      start.yield_time_ms == null
+        ? normalizeYieldTime(start.default_yield_time_ms)
+        : normalizeYieldTime(start.yield_time_ms),
     initial_yield_timer: null,
     initial_yield_triggered: false,
     max_output_tokens_per_exec_call: maxOutputTokensPerExecCall,
@@ -618,11 +656,6 @@ function startSession(protocol, sessions, start) {
     }),
   };
   sessions.set(session.id, session);
-  const initialYieldTime =
-    start.yield_time_ms == null
-      ? session.default_yield_time_ms
-      : normalizeYieldTime(start.yield_time_ms);
-  scheduleInitialYield(protocol, session, initialYieldTime);
 
   session.worker.on('message', (message) => {
     void handleWorkerMessage(protocol, sessions, session, message).catch((error) => {
@@ -658,6 +691,11 @@ async function handleWorkerMessage(protocol, sessions, session, message) {
 
   if (message.type === 'content_item') {
     session.content_items.push(cloneJsonValue(message.item));
+    return;
+  }
+
+  if (message.type === 'started') {
+    scheduleInitialYield(protocol, session, session.initial_yield_time_ms);
     return;
   }
 

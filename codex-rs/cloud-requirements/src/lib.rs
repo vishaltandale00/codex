@@ -16,6 +16,7 @@ use chrono::Duration as ChronoDuration;
 use chrono::Utc;
 use codex_backend_client::Client as BackendClient;
 use codex_core::AuthManager;
+use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::auth::CodexAuth;
 use codex_core::auth::RefreshTokenError;
 use codex_core::config_loader::CloudRequirementsLoadError;
@@ -285,7 +286,7 @@ impl CloudRequirementsService {
             .map_err(|_| {
                 CloudRequirementsLoadError::new(
                     CloudRequirementsLoadErrorCode::Timeout,
-                    None,
+                    /*status_code*/ None,
                     format!(
                         "timed out waiting for cloud requirements after {}s",
                         self.timeout.as_secs()
@@ -367,7 +368,9 @@ impl CloudRequirementsService {
         while attempt <= CLOUD_REQUIREMENTS_MAX_ATTEMPTS {
             let contents = match self.fetcher.fetch_requirements(&auth).await {
                 Ok(contents) => {
-                    emit_fetch_attempt_metric(trigger, attempt, "success", None);
+                    emit_fetch_attempt_metric(
+                        trigger, attempt, "success", /*status_code*/ None,
+                    );
                     contents
                 }
                 Err(FetchAttemptError::Retryable(status)) => {
@@ -399,7 +402,7 @@ impl CloudRequirementsService {
                             "Cloud requirements request was unauthorized; attempting auth recovery"
                         );
                         match auth_recovery.next().await {
-                            Ok(()) => {
+                            Ok(_) => {
                                 let Some(refreshed_auth) = self.auth_manager.auth().await else {
                                     tracing::error!(
                                         "Auth recovery succeeded but no auth is available for cloud requirements"
@@ -487,7 +490,7 @@ impl CloudRequirementsService {
                         );
                         return Err(CloudRequirementsLoadError::new(
                             CloudRequirementsLoadErrorCode::Parse,
-                            None,
+                            /*status_code*/ None,
                             CLOUD_REQUIREMENTS_LOAD_FAILED_MESSAGE,
                         ));
                     }
@@ -500,7 +503,9 @@ impl CloudRequirementsService {
                 tracing::warn!(error = %err, "Failed to write cloud requirements cache");
             }
 
-            emit_fetch_final_metric(trigger, "success", "none", attempt, None);
+            emit_fetch_final_metric(
+                trigger, "success", "none", attempt, /*status_code*/ None,
+            );
             return Ok(requirements);
         }
 
@@ -708,11 +713,25 @@ pub fn cloud_requirements_loader(
             tracing::error!(error = %err, "Cloud requirements task failed");
             CloudRequirementsLoadError::new(
                 CloudRequirementsLoadErrorCode::Internal,
-                None,
+                /*status_code*/ None,
                 format!("cloud requirements load failed: {err}"),
             )
         })?
     })
+}
+
+pub fn cloud_requirements_loader_for_storage(
+    codex_home: PathBuf,
+    enable_codex_api_key_env: bool,
+    credentials_store_mode: AuthCredentialsStoreMode,
+    chatgpt_base_url: String,
+) -> CloudRequirementsLoader {
+    let auth_manager = AuthManager::shared(
+        codex_home.clone(),
+        enable_codex_api_key_env,
+        credentials_store_mode,
+    );
+    cloud_requirements_loader(auth_manager, chatgpt_base_url, codex_home)
 }
 
 fn parse_cloud_requirements(
@@ -792,7 +811,7 @@ fn emit_metric(metric_name: &str, tags: Vec<(&str, String)>) {
             .iter()
             .map(|(key, value)| (*key, value.as_str()))
             .collect::<Vec<_>>();
-        let _ = metrics.counter(metric_name, 1, &tag_refs);
+        let _ = metrics.counter(metric_name, /*inc*/ 1, &tag_refs);
     }
 }
 
@@ -805,6 +824,7 @@ mod tests {
     use codex_protocol::protocol::AskForApproval;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::collections::VecDeque;
     use std::future::pending;
     use std::path::Path;
@@ -1102,8 +1122,10 @@ mod tests {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
                 feature_requirements: None,
                 mcp_servers: None,
+                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
@@ -1145,11 +1167,38 @@ mod tests {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
                 feature_requirements: None,
                 mcp_servers: None,
+                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_cloud_requirements_parses_apps_requirements_toml() {
+        let result = parse_for_fetch(Some(
+            r#"
+[apps.connector_5f3c8c41a1e54ad7a76272c89e2554fa]
+enabled = false
+"#,
+        ));
+
+        assert_eq!(
+            result,
+            Some(ConfigRequirementsToml {
+                apps: Some(codex_core::config_loader::AppsRequirementsToml {
+                    apps: BTreeMap::from([(
+                        "connector_5f3c8c41a1e54ad7a76272c89e2554fa".to_string(),
+                        codex_core::config_loader::AppRequirementToml {
+                            enabled: Some(false),
+                        },
+                    )]),
+                }),
+                ..Default::default()
             })
         );
     }
@@ -1199,8 +1248,10 @@ mod tests {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
                 feature_requirements: None,
                 mcp_servers: None,
+                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
@@ -1249,8 +1300,10 @@ mod tests {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
                 feature_requirements: None,
                 mcp_servers: None,
+                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
@@ -1299,8 +1352,10 @@ mod tests {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
                 feature_requirements: None,
                 mcp_servers: None,
+                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
@@ -1459,8 +1514,10 @@ mod tests {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
                 feature_requirements: None,
                 mcp_servers: None,
+                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
@@ -1487,8 +1544,10 @@ mod tests {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
                 feature_requirements: None,
                 mcp_servers: None,
+                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
@@ -1535,8 +1594,10 @@ mod tests {
                 allowed_approval_policies: Some(vec![AskForApproval::OnRequest]),
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
                 feature_requirements: None,
                 mcp_servers: None,
+                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
@@ -1582,8 +1643,10 @@ mod tests {
                 allowed_approval_policies: Some(vec![AskForApproval::OnRequest]),
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
                 feature_requirements: None,
                 mcp_servers: None,
+                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
@@ -1633,8 +1696,10 @@ mod tests {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
                 feature_requirements: None,
                 mcp_servers: None,
+                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
@@ -1685,8 +1750,10 @@ mod tests {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
                 feature_requirements: None,
                 mcp_servers: None,
+                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
@@ -1737,8 +1804,10 @@ mod tests {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
                 feature_requirements: None,
                 mcp_servers: None,
+                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
@@ -1822,8 +1891,10 @@ mod tests {
                 allowed_approval_policies: Some(vec![AskForApproval::Never]),
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
                 feature_requirements: None,
                 mcp_servers: None,
+                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
@@ -1846,8 +1917,10 @@ mod tests {
                 allowed_approval_policies: Some(vec![AskForApproval::OnRequest]),
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
+                guardian_developer_instructions: None,
                 feature_requirements: None,
                 mcp_servers: None,
+                apps: None,
                 rules: None,
                 enforce_residency: None,
                 network: None,
