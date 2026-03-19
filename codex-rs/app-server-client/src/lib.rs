@@ -1075,6 +1075,7 @@ mod tests {
         .expect("started thread should be visible through the shared thread manager");
         let thread_ids = client.thread_manager().list_thread_ids().await;
         assert!(thread_ids.contains(&created_thread_id));
+
         client.shutdown().await.expect("shutdown should complete");
     }
 

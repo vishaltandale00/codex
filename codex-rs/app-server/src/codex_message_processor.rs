@@ -227,7 +227,7 @@ use codex_core::plugins::PluginReadRequest;
 use codex_core::plugins::PluginUninstallError as CorePluginUninstallError;
 use codex_core::plugins::load_plugin_apps;
 use codex_core::read_head_for_summary;
-use codex_core::resolve_recorded_thread_cwd;
+use codex_core::read_session_meta_line;
 use codex_core::rollout_date_parts;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_core::state_db::StateDbHandle;
@@ -3874,7 +3874,7 @@ impl CodexMessageProcessor {
         };
 
         let history_cwd =
-            resolve_recorded_thread_cwd(&self.config, source_thread_id, rollout_path.as_path())
+            read_history_cwd_from_state_db(&self.config, source_thread_id, rollout_path.as_path())
                 .await;
 
         // Persist Windows sandbox mode.
@@ -7663,6 +7663,30 @@ async fn derive_config_for_cwd(
         .cloud_requirements(cloud_requirements.clone())
         .build()
         .await
+}
+
+async fn read_history_cwd_from_state_db(
+    config: &Config,
+    thread_id: Option<ThreadId>,
+    rollout_path: &Path,
+) -> Option<PathBuf> {
+    if let Some(state_db_ctx) = get_state_db(config).await
+        && let Some(thread_id) = thread_id
+        && let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await
+        && !metadata.cwd.as_os_str().is_empty()
+    {
+        return Some(metadata.cwd);
+    }
+
+    match read_session_meta_line(rollout_path).await {
+        Ok(meta_line) if !meta_line.meta.cwd.as_os_str().is_empty() => Some(meta_line.meta.cwd),
+        Ok(_) => None,
+        Err(err) => {
+            let rollout_path = rollout_path.display();
+            warn!("failed to read session metadata from rollout {rollout_path}: {err}");
+            None
+        }
+    }
 }
 
 async fn read_summary_from_state_db_by_thread_id(
