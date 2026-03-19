@@ -988,16 +988,10 @@ impl McpProcess {
             })
             .await?;
 
-        match message {
-            JSONRPCMessage::Response(response) => Ok(response),
-            JSONRPCMessage::Error(error) => anyhow::bail!(
-                "expected JSONRPCMessage::Response for {request_id:?}, got JSONRPCMessage::Error: {}",
-                error.error.message
-            ),
-            message => anyhow::bail!(
-                "expected JSONRPCMessage::Response for {request_id:?}, got {message:?}"
-            ),
-        }
+        let JSONRPCMessage::Response(response) = message else {
+            unreachable!("expected JSONRPCMessage::Response, got {message:?}");
+        };
+        Ok(response)
     }
 
     pub async fn read_stream_until_error_message(
@@ -1010,16 +1004,10 @@ impl McpProcess {
             })
             .await?;
 
-        match message {
-            JSONRPCMessage::Error(err) => Ok(err),
-            JSONRPCMessage::Response(response) => anyhow::bail!(
-                "expected JSONRPCMessage::Error for {request_id:?}, got JSONRPCMessage::Response: {:?}",
-                response.id
-            ),
-            message => {
-                anyhow::bail!("expected JSONRPCMessage::Error for {request_id:?}, got {message:?}")
-            }
-        }
+        let JSONRPCMessage::Error(err) = message else {
+            unreachable!("expected JSONRPCMessage::Error, got {message:?}");
+        };
+        Ok(err)
     }
 
     pub async fn read_stream_until_notification_message(

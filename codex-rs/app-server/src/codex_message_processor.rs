@@ -7673,14 +7673,12 @@ async fn read_history_cwd_from_state_db(
     if let Some(state_db_ctx) = get_state_db(config).await
         && let Some(thread_id) = thread_id
         && let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await
-        && !metadata.cwd.as_os_str().is_empty()
     {
         return Some(metadata.cwd);
     }
 
     match read_session_meta_line(rollout_path).await {
-        Ok(meta_line) if !meta_line.meta.cwd.as_os_str().is_empty() => Some(meta_line.meta.cwd),
-        Ok(_) => None,
+        Ok(meta_line) => Some(meta_line.meta.cwd),
         Err(err) => {
             let rollout_path = rollout_path.display();
             warn!("failed to read session metadata from rollout {rollout_path}: {err}");

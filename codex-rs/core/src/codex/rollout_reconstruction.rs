@@ -9,13 +9,6 @@ pub(super) struct RolloutReconstruction {
     pub(super) reference_context_item: Option<TurnContextItem>,
 }
 
-#[derive(Debug)]
-struct SegmentReconstruction {
-    history: Vec<ResponseItem>,
-    previous_turn_settings: Option<PreviousTurnSettings>,
-    reference_context_item: TurnReferenceContextItem,
-}
-
 #[derive(Debug, Default)]
 enum TurnReferenceContextItem {
     /// No `TurnContextItem` has been seen for this replay span yet.
@@ -98,35 +91,36 @@ impl Session {
         let mut history = Vec::new();
         let mut previous_turn_settings = None;
         let mut reference_context_item = TurnReferenceContextItem::NeverSet;
-        let mut segment_items = Vec::new();
+        let mut segment_start = 0;
 
-        let mut flush_segment = |segment_items: &mut Vec<RolloutItem>| {
+        let mut flush_segment = |segment_items: &[RolloutItem]| {
             if segment_items.is_empty() {
                 return;
             }
-            let segment = self.reconstruct_rollout_segment(turn_context, segment_items);
-            history.extend(segment.history);
-            if segment.previous_turn_settings.is_some() {
-                previous_turn_settings = segment.previous_turn_settings;
+            let (segment_history, segment_previous_turn_settings, segment_reference_context_item) =
+                self.reconstruct_rollout_segment(turn_context, segment_items);
+            history.extend(segment_history);
+            if segment_previous_turn_settings.is_some() {
+                previous_turn_settings = segment_previous_turn_settings;
             }
             if !matches!(
-                segment.reference_context_item,
+                segment_reference_context_item,
                 TurnReferenceContextItem::NeverSet
             ) {
-                reference_context_item = segment.reference_context_item;
+                reference_context_item = segment_reference_context_item;
             }
-            segment_items.clear();
         };
 
-        for item in rollout_items {
+        for (index, item) in rollout_items.iter().enumerate() {
             match item {
                 RolloutItem::SessionMeta(_) | RolloutItem::MergeBoundary(_) => {
-                    flush_segment(&mut segment_items);
+                    flush_segment(&rollout_items[segment_start..index]);
+                    segment_start = index + 1;
                 }
-                _ => segment_items.push(item.clone()),
+                _ => {}
             }
         }
-        flush_segment(&mut segment_items);
+        flush_segment(&rollout_items[segment_start..]);
 
         let reference_context_item = match reference_context_item {
             TurnReferenceContextItem::NeverSet | TurnReferenceContextItem::Cleared => None,
@@ -146,7 +140,11 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
-    ) -> SegmentReconstruction {
+    ) -> (
+        Vec<ResponseItem>,
+        Option<PreviousTurnSettings>,
+        TurnReferenceContextItem,
+    ) {
         // Replay metadata should already match the shape of the future lazy reverse loader, even
         // while history materialization still uses an eager bridge. Scan newest-to-oldest,
         // stopping once a surviving replacement-history checkpoint and the required resume metadata
@@ -343,10 +341,10 @@ impl Session {
             reference_context_item
         };
 
-        SegmentReconstruction {
-            history: history.raw_items().to_vec(),
+        (
+            history.raw_items().to_vec(),
             previous_turn_settings,
             reference_context_item,
-        }
+        )
     }
 }
