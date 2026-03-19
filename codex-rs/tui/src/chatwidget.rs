@@ -63,6 +63,7 @@ use codex_core::config_loader::ConfigLayerStackOrdering;
 use codex_core::features::FEATURES;
 use codex_core::features::Feature;
 use codex_core::find_thread_name_by_id;
+use codex_core::find_thread_names_by_ids;
 use codex_core::git_info::current_branch_name;
 use codex_core::git_info::get_git_repo_root;
 use codex_core::git_info::local_git_branches;
@@ -183,6 +184,7 @@ const PLAN_MODE_REASONING_SCOPE_TITLE: &str = "Apply reasoning change";
 const PLAN_MODE_REASONING_SCOPE_PLAN_ONLY: &str = "Apply to Plan mode override";
 const PLAN_MODE_REASONING_SCOPE_ALL_MODES: &str = "Apply to global default and Plan mode override";
 const CONNECTORS_SELECTION_VIEW_ID: &str = "connectors-selection";
+const COMBINE_SELECTION_VIEW_ID: &str = "combine-selection";
 
 /// Choose the keybinding used to edit the most-recently queued message.
 ///
@@ -213,6 +215,7 @@ fn queued_message_edit_binding_for_terminal(terminal_name: TerminalName) -> KeyB
 }
 
 use crate::app_event::AppEvent;
+use crate::app_event::CombineCandidateThread;
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_event::ExitMode;
 #[cfg(target_os = "windows")]
@@ -232,6 +235,8 @@ use crate::bottom_pane::InputResult;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::McpServerElicitationFormRequest;
 use crate::bottom_pane::MentionBinding;
+use crate::bottom_pane::MultiSelectItem;
+use crate::bottom_pane::MultiSelectPicker;
 use crate::bottom_pane::QUIT_SHORTCUT_TIMEOUT;
 use crate::bottom_pane::SelectionAction;
 use crate::bottom_pane::SelectionItem;
@@ -1445,43 +1450,58 @@ impl ChatWidget {
         let app_event_tx = self.app_event_tx.clone();
         let codex_home = self.config.codex_home.clone();
         tokio::spawn(async move {
-            let forked_from_id_text = forked_from_id.to_string();
-            let send_name_and_id = |name: String| {
-                let line: Line<'static> = vec![
-                    "• ".dim(),
-                    "Thread forked from ".into(),
-                    name.cyan(),
-                    " (".into(),
-                    forked_from_id_text.clone().cyan(),
-                    ")".into(),
-                ]
-                .into();
-                app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
-                    PlainHistoryCell::new(vec![line]),
-                )));
-            };
-            let send_id_only = || {
-                let line: Line<'static> = vec![
-                    "• ".dim(),
-                    "Thread forked from ".into(),
-                    forked_from_id_text.clone().cyan(),
-                ]
-                .into();
-                app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
-                    PlainHistoryCell::new(vec![line]),
-                )));
-            };
+            let label = thread_label_from_id(codex_home.as_path(), forked_from_id).await;
+            let line: Line<'static> =
+                vec!["• ".dim(), "Thread forked from ".into(), label.cyan()].into();
+            app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                PlainHistoryCell::new(vec![line]),
+            )));
+        });
+    }
 
-            match find_thread_name_by_id(&codex_home, &forked_from_id).await {
-                Ok(Some(name)) if !name.trim().is_empty() => {
-                    send_name_and_id(name);
-                }
-                Ok(_) => send_id_only(),
+    pub(crate) fn emit_combined_thread_event(
+        &self,
+        combine_base_thread_id: ThreadId,
+        combined_from_thread_ids: Vec<ThreadId>,
+    ) {
+        let app_event_tx = self.app_event_tx.clone();
+        let codex_home = self.config.codex_home.clone();
+        tokio::spawn(async move {
+            let mut thread_ids = HashSet::with_capacity(1 + combined_from_thread_ids.len());
+            thread_ids.insert(combine_base_thread_id);
+            thread_ids.extend(combined_from_thread_ids.iter().copied());
+            let names = match find_thread_names_by_ids(codex_home.as_path(), &thread_ids).await {
+                Ok(names) => names,
                 Err(err) => {
-                    tracing::warn!("Failed to read forked thread name: {err}");
-                    send_id_only();
+                    tracing::warn!("Failed to read thread names for combine banner: {err}");
+                    HashMap::new()
                 }
+            };
+            let mut labels = Vec::with_capacity(thread_ids.len());
+            labels.push(
+                names
+                    .get(&combine_base_thread_id)
+                    .cloned()
+                    .unwrap_or_else(|| combine_base_thread_id.to_string()),
+            );
+            for thread_id in combined_from_thread_ids {
+                labels.push(
+                    names
+                        .get(&thread_id)
+                        .cloned()
+                        .unwrap_or_else(|| thread_id.to_string()),
+                );
             }
+
+            let line: Line<'static> = vec![
+                "• ".dim(),
+                "Thread combined from ".into(),
+                proper_join(labels.as_slice()).cyan(),
+            ]
+            .into();
+            app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                PlainHistoryCell::new(vec![line]),
+            )));
         });
     }
 
@@ -4278,6 +4298,175 @@ impl ChatWidget {
         self.request_redraw();
     }
 
+    pub(crate) fn show_combine_picker_loading(&mut self, request_id: u64) {
+        if !self.bottom_pane.replace_selection_view_if_active(
+            COMBINE_SELECTION_VIEW_ID,
+            self.combine_picker_loading_params(request_id),
+        ) {
+            self.bottom_pane
+                .show_selection_view(self.combine_picker_loading_params(request_id));
+        }
+        self.request_redraw();
+    }
+
+    pub(crate) fn dismiss_combine_picker_loading(&mut self) {
+        let _ = self
+            .bottom_pane
+            .dismiss_active_view_if_matches(COMBINE_SELECTION_VIEW_ID);
+        self.request_redraw();
+    }
+
+    fn combine_picker_loading_params(&self, request_id: u64) -> SelectionViewParams {
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from("Choose threads to combine".bold()));
+        header.push(Line::from("Loading candidate threads...".dim()));
+        header.push(Line::from(
+            "The list appears once candidate discovery finishes.".dim(),
+        ));
+
+        SelectionViewParams {
+            view_id: Some(COMBINE_SELECTION_VIEW_ID),
+            header: Box::new(header),
+            items: vec![SelectionItem {
+                name: "Loading threads...".to_string(),
+                description: Some(
+                    "Thread summaries are loading before you choose what to combine.".to_string(),
+                ),
+                is_disabled: true,
+                ..Default::default()
+            }],
+            on_cancel: Some(Box::new(move |tx| {
+                tx.send(AppEvent::CancelCombinePickerLoad { request_id });
+            })),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn show_combine_picker(
+        &mut self,
+        base_thread_id: ThreadId,
+        base_path: PathBuf,
+        cwd: PathBuf,
+        combine_threads: Vec<CombineCandidateThread>,
+    ) {
+        let items: Vec<MultiSelectItem> = combine_threads
+            .iter()
+            .map(|item| MultiSelectItem {
+                id: item.thread_id.to_string(),
+                name: item.display_name.clone(),
+                description: item.description.clone(),
+                enabled: false,
+            })
+            .collect();
+        let combine_thread_meta: HashMap<String, CombineCandidateThread> = combine_threads
+            .into_iter()
+            .map(|thread| (thread.thread_id.to_string(), thread))
+            .collect();
+        let picker = MultiSelectPicker::builder(
+            "Choose threads to combine".to_string(),
+            Some("Select threads to combine in order.".to_string()),
+            self.app_event_tx.clone(),
+        )
+        .items(items)
+        .instructions(vec![
+            "Press ".into(),
+            key_hint::plain(KeyCode::Char(' ')).into(),
+            " to toggle; ".into(),
+            key_hint::plain(KeyCode::Left).into(),
+            "/".into(),
+            key_hint::plain(KeyCode::Right).into(),
+            " to reorder; ".into(),
+            key_hint::plain(KeyCode::Enter).into(),
+            " to review selected; ".into(),
+            key_hint::plain(KeyCode::Esc).into(),
+            " to cancel".into(),
+        ])
+        .enable_ordering()
+        .require_selection("Press Space to select at least one thread before review.".to_string())
+        .on_confirm(move |selected_ids, tx| {
+            let combine_threads = selected_ids
+                .iter()
+                .filter_map(|id| combine_thread_meta.get(id).cloned())
+                .collect();
+            tx.send(AppEvent::OpenCombineReview {
+                base_thread_id,
+                base_path: base_path.clone(),
+                combine_threads,
+                cwd: cwd.clone(),
+            });
+        })
+        .build();
+        self.bottom_pane.show_multi_select_picker(picker);
+        self.request_redraw();
+    }
+
+    pub(crate) fn show_combine_review(
+        &mut self,
+        base_thread_id: ThreadId,
+        base_path: PathBuf,
+        cwd: PathBuf,
+        combine_threads: Vec<CombineCandidateThread>,
+    ) {
+        let combine_thread_ids: Vec<ThreadId> =
+            combine_threads.iter().map(|t| t.thread_id).collect();
+        let selected_count = combine_threads.len();
+        let mut header = ColumnRenderable::new();
+        header.push(Line::from("Review Combination".bold()));
+        header.push(Line::from(
+            "The base thread stays first; selected threads are appended after it.".dim(),
+        ));
+        header.push(Line::from("Confirm the selected threads in order.".dim()));
+        header.push(Line::from("Order affects the result.".dim()));
+        header.push(Line::from(
+            format!("Threads appended after base: {selected_count}").dim(),
+        ));
+        for (idx, combine_thread) in combine_threads.iter().enumerate() {
+            header.push(Line::from(format!(
+                "{}. {}",
+                idx + 1,
+                combine_thread.display_name
+            )));
+            if let Some(description) = &combine_thread.description {
+                header.push(Line::from(format!("   {description}").dim()));
+            }
+        }
+
+        let confirm_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
+            tx.send(AppEvent::CombineThreads {
+                base_thread_id,
+                base_path: base_path.clone(),
+                combine_thread_ids: combine_thread_ids.clone(),
+                cwd: cwd.clone(),
+            });
+        })];
+        let items = vec![
+            SelectionItem {
+                name: "Combine now".to_string(),
+                description: Some(
+                    "Create a new thread by appending the selected threads after the base thread."
+                        .to_string(),
+                ),
+                actions: confirm_actions,
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Cancel".to_string(),
+                description: Some("Return to the chat without combining threads.".to_string()),
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            header: Box::new(header),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+        self.request_redraw();
+    }
+
     pub(crate) fn no_modal_or_popup_active(&self) -> bool {
         self.bottom_pane.no_modal_or_popup_active()
     }
@@ -4332,6 +4521,9 @@ impl ChatWidget {
             }
             SlashCommand::Resume => {
                 self.app_event_tx.send(AppEvent::OpenResumePicker);
+            }
+            SlashCommand::Combine => {
+                self.app_event_tx.send(AppEvent::OpenCombinePicker);
             }
             SlashCommand::Fork => {
                 self.app_event_tx.send(AppEvent::ForkCurrentSession);
@@ -9244,6 +9436,18 @@ impl ChatWidget {
             )),
         );
         RenderableItem::Owned(Box::new(flex))
+    }
+}
+
+async fn thread_label_from_id(codex_home: &Path, thread_id: ThreadId) -> String {
+    let thread_id_text = thread_id.to_string();
+    match find_thread_name_by_id(codex_home, &thread_id).await {
+        Ok(Some(name)) if !name.trim().is_empty() => format!("{name} ({thread_id_text})"),
+        Ok(_) => thread_id_text,
+        Err(err) => {
+            tracing::warn!("Failed to read thread name: {err}");
+            thread_id_text
+        }
     }
 }
 

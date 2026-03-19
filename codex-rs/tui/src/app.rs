@@ -1,5 +1,6 @@
 use crate::app_backtrack::BacktrackState;
 use crate::app_event::AppEvent;
+use crate::app_event::CombineCandidateThread;
 use crate::app_event::ExitMode;
 use crate::app_event::RealtimeAudioDeviceKind;
 #[cfg(target_os = "windows")]
@@ -42,7 +43,10 @@ use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
+use codex_core::INTERACTIVE_SESSION_SOURCES;
+use codex_core::RolloutRecorder;
 use codex_core::ThreadManager;
+use codex_core::ThreadSortKey;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
@@ -56,6 +60,8 @@ use codex_core::models_manager::collaboration_mode_presets::CollaborationModesCo
 use codex_core::models_manager::manager::RefreshStrategy;
 use codex_core::models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
 use codex_core::models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
+use codex_core::paths_match;
+use codex_core::resolve_recorded_thread_cwd;
 #[cfg(target_os = "windows")]
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_otel::SessionTelemetry;
@@ -121,6 +127,8 @@ use self::pending_interactive_replay::PendingInteractiveReplayState;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
+
+const COMBINE_PICKER_PAGE_SIZE: usize = 100;
 
 enum ThreadInteractiveRequest {
     Approval(ApprovalRequest),
@@ -275,6 +283,86 @@ fn emit_project_config_warnings(app_event_tx: &AppEventSender, config: &Config) 
     )));
 }
 
+async fn collect_combine_picker_items(
+    config: &Config,
+    base_thread_id: ThreadId,
+    base_cwd: PathBuf,
+    excluded_thread_id: Option<ThreadId>,
+) -> Result<Vec<CombineCandidateThread>> {
+    let started_at = Instant::now();
+    let mut cursor = None;
+    let mut items = Vec::new();
+    let mut page_count = 0usize;
+    let model_providers = [config.model_provider_id.clone()];
+
+    loop {
+        let page_started_at = Instant::now();
+        let page = RolloutRecorder::list_threads(
+            config,
+            COMBINE_PICKER_PAGE_SIZE,
+            cursor.as_ref(),
+            ThreadSortKey::UpdatedAt,
+            INTERACTIVE_SESSION_SOURCES,
+            Some(&model_providers),
+            config.model_provider_id.as_str(),
+            None,
+        )
+        .await?;
+        page_count += 1;
+        tracing::debug!(
+            page = page_count,
+            fetched_threads = page.items.len(),
+            has_next_page = page.next_cursor.is_some(),
+            elapsed_ms = page_started_at.elapsed().as_millis(),
+            "combine picker page loaded"
+        );
+
+        for thread in &page.items {
+            let Some(thread_id) = thread.thread_id else {
+                continue;
+            };
+            if thread_id == base_thread_id || Some(thread_id) == excluded_thread_id {
+                continue;
+            }
+            let Some(candidate_cwd) = thread.cwd.as_ref() else {
+                continue;
+            };
+            if !paths_match(candidate_cwd.as_path(), base_cwd.as_path()) {
+                continue;
+            }
+            let name = thread
+                .first_user_message
+                .clone()
+                .unwrap_or_else(|| "(No turns yet)".to_string());
+            let description = thread
+                .cwd
+                .as_ref()
+                .map(|cwd| format!("cwd: {}", cwd.display()));
+            items.push(CombineCandidateThread {
+                path: thread.path.clone(),
+                thread_id,
+                display_name: name,
+                description,
+            });
+        }
+
+        if let Some(next_cursor) = page.next_cursor {
+            cursor = Some(next_cursor);
+        } else {
+            break;
+        }
+    }
+
+    tracing::info!(
+        excluded_thread_id = excluded_thread_id.map(|id| id.to_string()),
+        page_count,
+        candidate_count = items.len(),
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "combine picker items collected"
+    );
+    Ok(items)
+}
+
 fn emit_missing_system_bwrap_warning(app_event_tx: &AppEventSender) {
     let Some(message) = codex_core::config::missing_system_bwrap_warning() else {
         return;
@@ -284,7 +372,6 @@ fn emit_missing_system_bwrap_warning(app_event_tx: &AppEventSender) {
         history_cell::new_warning_event(message),
     )));
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionSummary {
     usage_line: String,
@@ -737,6 +824,8 @@ pub(crate) struct App {
     primary_thread_id: Option<ThreadId>,
     primary_session_configured: Option<SessionConfiguredEvent>,
     pending_primary_events: VecDeque<Event>,
+    next_combine_request_id: u64,
+    pending_combine_picker_request_id: Option<u64>,
 }
 
 #[derive(Default)]
@@ -1940,6 +2029,10 @@ impl App {
         )
     }
 
+    fn picker_requests_new_session(session_selection: &SessionSelection) -> bool {
+        matches!(session_selection, SessionSelection::StartFresh)
+    }
+
     fn should_handle_active_thread_events(
         waiting_for_initial_session_configured: bool,
         has_active_thread_receiver: bool,
@@ -2206,6 +2299,8 @@ impl App {
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
+            next_combine_request_id: 0,
+            pending_combine_picker_request_id: None,
         };
 
         // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
@@ -2424,13 +2519,18 @@ impl App {
                 self.start_fresh_session_with_summary_hint(tui).await;
             }
             AppEvent::OpenResumePicker => {
-                match crate::resume_picker::run_resume_picker(
+                let selection = crate::resume_picker::run_resume_picker(
                     tui,
                     &self.config,
                     /*show_all*/ false,
                 )
-                .await?
-                {
+                .await?;
+                if Self::picker_requests_new_session(&selection) {
+                    self.start_fresh_session_with_summary_hint(tui).await;
+                    tui.frame_requester().schedule_frame();
+                    return Ok(AppRunControl::Continue);
+                }
+                match selection {
                     SessionSelection::Resume(target_session) => {
                         let current_cwd = self.config.cwd.clone();
                         let resume_cwd = match crate::resolve_cwd_for_resume_or_fork(
@@ -2522,6 +2622,99 @@ impl App {
                 // Leaving alt-screen may blank the inline viewport; force a redraw either way.
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::OpenCombinePicker => {
+                let selection =
+                    crate::resume_picker::run_combine_picker(tui, &self.config, false).await?;
+                if Self::picker_requests_new_session(&selection) {
+                    self.start_fresh_session_with_summary_hint(tui).await;
+                    tui.frame_requester().schedule_frame();
+                    return Ok(AppRunControl::Continue);
+                }
+                match selection {
+                    SessionSelection::Resume(target_session) => {
+                        tracing::info!(
+                            base_thread_id = %target_session.thread_id,
+                            base_rollout_path = %target_session.path.display(),
+                            "combine picker base thread selected"
+                        );
+                        let current_cwd = self.config.cwd.clone();
+                        let cwd_resolution_started_at = Instant::now();
+                        let combine_cwd = match crate::resolve_cwd_for_resume_or_fork(
+                            tui,
+                            &self.config,
+                            &current_cwd,
+                            target_session.thread_id,
+                            &target_session.path,
+                            CwdPromptAction::Combine,
+                            true,
+                        )
+                        .await?
+                        {
+                            crate::ResolveCwdOutcome::Continue(Some(cwd)) => cwd,
+                            crate::ResolveCwdOutcome::Continue(None) => current_cwd.clone(),
+                            crate::ResolveCwdOutcome::Exit => {
+                                return Ok(AppRunControl::Exit(ExitReason::UserRequested));
+                            }
+                        };
+                        tracing::info!(
+                            base_thread_id = %target_session.thread_id,
+                            combine_cwd = %combine_cwd.display(),
+                            elapsed_ms = cwd_resolution_started_at.elapsed().as_millis(),
+                            "combine picker cwd resolved"
+                        );
+                        self.next_combine_request_id += 1;
+                        let request_id = self.next_combine_request_id;
+                        self.pending_combine_picker_request_id = Some(request_id);
+                        self.chat_widget
+                            .add_plain_history_lines(vec!["/combine".magenta().into()]);
+                        self.chat_widget.show_combine_picker_loading(request_id);
+                        let config = self.config.clone();
+                        let excluded_thread_id = self.chat_widget.thread_id();
+                        let app_event_tx = self.app_event_tx.clone();
+                        let base_thread_id = target_session.thread_id;
+                        let base_path = target_session.path;
+                        let base_cwd = match resolve_recorded_thread_cwd(
+                            &self.config,
+                            Some(base_thread_id),
+                            base_path.as_path(),
+                        )
+                        .await
+                        {
+                            Some(cwd) => cwd,
+                            None => {
+                                tracing::warn!(
+                                    base_thread_id = %base_thread_id,
+                                    base_rollout_path = %base_path.display(),
+                                    "Failed to resolve base thread workspace for combine picker"
+                                );
+                                current_cwd.clone()
+                            }
+                        };
+                        tokio::spawn(async move {
+                            let result = collect_combine_picker_items(
+                                &config,
+                                base_thread_id,
+                                base_cwd,
+                                excluded_thread_id,
+                            )
+                            .await
+                            .map_err(|err| err.to_string());
+                            app_event_tx.send(AppEvent::CombinePickerLoaded {
+                                request_id,
+                                base_thread_id,
+                                base_path,
+                                cwd: combine_cwd,
+                                result,
+                            });
+                        });
+                    }
+                    SessionSelection::Exit
+                    | SessionSelection::StartFresh
+                    | SessionSelection::Fork(_) => {}
+                }
+
+                tui.frame_requester().schedule_frame();
+            }
             AppEvent::ForkCurrentSession => {
                 self.session_telemetry.counter(
                     "codex.thread.fork",
@@ -2595,6 +2788,152 @@ impl App {
                         "A thread must contain at least one turn before it can be forked."
                             .to_string(),
                     );
+                }
+
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::CancelCombinePickerLoad { request_id } => {
+                if self.pending_combine_picker_request_id == Some(request_id) {
+                    self.pending_combine_picker_request_id = None;
+                }
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::OpenCombineReview {
+                base_thread_id,
+                base_path,
+                combine_threads,
+                cwd,
+            } => {
+                self.chat_widget.show_combine_review(
+                    base_thread_id,
+                    base_path,
+                    cwd,
+                    combine_threads,
+                );
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::CombinePickerLoaded {
+                request_id,
+                base_thread_id,
+                base_path,
+                cwd,
+                result,
+            } => {
+                if self.pending_combine_picker_request_id != Some(request_id) {
+                    return Ok(AppRunControl::Continue);
+                }
+                self.pending_combine_picker_request_id = None;
+                self.chat_widget.dismiss_combine_picker_loading();
+                match result {
+                    Ok(items) if items.is_empty() => {
+                        self.chat_widget.add_error_message(
+                            "No other threads are available to combine.".to_string(),
+                        );
+                    }
+                    Ok(items) => {
+                        self.chat_widget
+                            .show_combine_picker(base_thread_id, base_path, cwd, items);
+                    }
+                    Err(err) => {
+                        self.chat_widget
+                            .add_error_message(format!("Failed to open combine picker: {err}"));
+                    }
+                }
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::CombineThreads {
+                base_thread_id,
+                base_path,
+                combine_thread_ids,
+                cwd,
+            } => {
+                if combine_thread_ids.is_empty() {
+                    self.chat_widget
+                        .add_error_message("Select at least one thread to combine.".to_string());
+                    tui.frame_requester().schedule_frame();
+                    return Ok(AppRunControl::Continue);
+                }
+
+                self.refresh_in_memory_config_from_disk_best_effort("combining threads")
+                    .await;
+                let current_cwd = self.config.cwd.clone();
+                let mut combine_config = match self
+                    .rebuild_config_for_resume_or_fallback(&current_cwd, cwd)
+                    .await
+                {
+                    Ok(cfg) => cfg,
+                    Err(err) => {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to rebuild configuration for combine: {err}"
+                        ));
+                        tui.frame_requester().schedule_frame();
+                        return Ok(AppRunControl::Continue);
+                    }
+                };
+                self.apply_runtime_policy_overrides(&mut combine_config);
+                let summary = session_summary(
+                    self.chat_widget.token_usage(),
+                    self.chat_widget.thread_id(),
+                    self.chat_widget.thread_name(),
+                );
+                let combined_from_thread_ids = combine_thread_ids.clone();
+                let mut combine_sources = Vec::new();
+                for combine_thread_id in combine_thread_ids {
+                    let Some(path) = codex_core::find_thread_path_by_id_str(
+                        &self.config.codex_home,
+                        &combine_thread_id.to_string(),
+                    )
+                    .await?
+                    else {
+                        self.chat_widget
+                            .add_error_message("Failed to find the selected thread.".to_string());
+                        tui.frame_requester().schedule_frame();
+                        return Ok(AppRunControl::Continue);
+                    };
+                    combine_sources.push((combine_thread_id, path));
+                }
+
+                match self
+                    .server
+                    .combine_threads(
+                        base_thread_id,
+                        combine_config.clone(),
+                        base_path,
+                        combine_sources,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(combined) => {
+                        self.shutdown_current_thread().await;
+                        self.config = combine_config;
+                        tui.set_notification_method(self.config.tui_notification_method);
+                        self.file_search.update_search_dir(self.config.cwd.clone());
+                        let init = self
+                            .chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
+                        self.chat_widget = ChatWidget::new_from_existing(
+                            init,
+                            combined.thread,
+                            combined.session_configured,
+                        );
+                        self.chat_widget
+                            .emit_combined_thread_event(base_thread_id, combined_from_thread_ids);
+                        self.reset_thread_event_state();
+                        if let Some(summary) = summary {
+                            let mut lines: Vec<Line<'static>> =
+                                vec![summary.usage_line.clone().into()];
+                            if let Some(command) = summary.resume_command {
+                                let spans =
+                                    vec!["To continue this session, run ".into(), command.cyan()];
+                                lines.push(spans.into());
+                            }
+                            self.chat_widget.add_plain_history_lines(lines);
+                        }
+                    }
+                    Err(err) => {
+                        self.chat_widget
+                            .add_error_message(format!("Failed to combine threads: {err}"));
+                    }
                 }
 
                 tui.frame_requester().schedule_frame();
@@ -4228,6 +4567,8 @@ mod tests {
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionConfiguredEvent;
+    use codex_protocol::protocol::SessionMeta;
+    use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadRolledBackEvent;
     use codex_protocol::protocol::TurnAbortReason;
@@ -4241,6 +4582,7 @@ mod tests {
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
     use ratatui::prelude::Line;
+    use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -4264,6 +4606,124 @@ mod tests {
             vec![base_cwd.join("rel")]
         );
         Ok(())
+    }
+
+    fn write_combine_picker_rollout(
+        codex_home: &std::path::Path,
+        filename_ts: &str,
+        thread_id: ThreadId,
+        parent_thread_id: Option<ThreadId>,
+        cwd: &std::path::Path,
+        preview: &str,
+        provider: &str,
+    ) -> Result<PathBuf> {
+        let year = &filename_ts[0..4];
+        let month = &filename_ts[5..7];
+        let day = &filename_ts[8..10];
+        let dir = codex_home.join("sessions").join(year).join(month).join(day);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("rollout-{filename_ts}-{thread_id}.jsonl"));
+        let timestamp = "2026-01-01T00:00:00Z";
+        let payload = serde_json::to_value(SessionMetaLine {
+            meta: SessionMeta {
+                id: thread_id,
+                forked_from_id: parent_thread_id,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: None,
+                timestamp: timestamp.to_string(),
+                cwd: cwd.to_path_buf(),
+                originator: "test".to_string(),
+                cli_version: "0.0.0".to_string(),
+                source: SessionSource::Cli,
+                agent_nickname: None,
+                agent_role: None,
+                model_provider: Some(provider.to_string()),
+                base_instructions: None,
+                dynamic_tools: None,
+                memory_mode: None,
+            },
+            git: None,
+        })?;
+        let lines = vec![
+            json!({
+                "timestamp": timestamp,
+                "type": "session_meta",
+                "payload": payload,
+            }),
+            json!({
+                "timestamp": timestamp,
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": preview}],
+                },
+            }),
+            json!({
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": preview,
+                    "kind": "plain",
+                },
+            }),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )?;
+        Ok(path)
+    }
+
+    fn write_empty_combine_picker_rollout(
+        codex_home: &std::path::Path,
+        filename_ts: &str,
+        thread_id: ThreadId,
+        parent_thread_id: Option<ThreadId>,
+        cwd: &std::path::Path,
+        provider: &str,
+    ) -> Result<PathBuf> {
+        let year = &filename_ts[0..4];
+        let month = &filename_ts[5..7];
+        let day = &filename_ts[8..10];
+        let dir = codex_home.join("sessions").join(year).join(month).join(day);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("rollout-{filename_ts}-{thread_id}.jsonl"));
+        let timestamp = "2026-01-01T00:00:00Z";
+        let payload = serde_json::to_value(SessionMetaLine {
+            meta: SessionMeta {
+                id: thread_id,
+                forked_from_id: parent_thread_id,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: None,
+                timestamp: timestamp.to_string(),
+                cwd: cwd.to_path_buf(),
+                originator: "test".to_string(),
+                cli_version: "0.0.0".to_string(),
+                source: SessionSource::Cli,
+                agent_nickname: None,
+                agent_role: None,
+                model_provider: Some(provider.to_string()),
+                base_instructions: None,
+                dynamic_tools: None,
+                memory_mode: None,
+            },
+            git: None,
+        })?;
+        let line = json!({
+            "timestamp": timestamp,
+            "type": "session_meta",
+            "payload": payload,
+        })
+        .to_string();
+        std::fs::write(&path, format!("{line}\n"))?;
+        Ok(path)
     }
 
     #[test]
@@ -4292,6 +4752,36 @@ mod tests {
                     thread_id: ThreadId::new(),
                 }
             )),
+            false
+        );
+    }
+
+    #[test]
+    fn inline_picker_start_fresh_maps_to_new_session() {
+        assert_eq!(
+            App::picker_requests_new_session(&SessionSelection::StartFresh),
+            true
+        );
+        assert_eq!(
+            App::picker_requests_new_session(&SessionSelection::Resume(
+                crate::resume_picker::SessionTarget {
+                    path: PathBuf::from("/tmp/restore"),
+                    thread_id: ThreadId::new(),
+                }
+            )),
+            false
+        );
+        assert_eq!(
+            App::picker_requests_new_session(&SessionSelection::Fork(
+                crate::resume_picker::SessionTarget {
+                    path: PathBuf::from("/tmp/fork"),
+                    thread_id: ThreadId::new(),
+                }
+            )),
+            false
+        );
+        assert_eq!(
+            App::picker_requests_new_session(&SessionSelection::Exit),
             false
         );
     }
@@ -4346,6 +4836,234 @@ mod tests {
             App::should_handle_active_thread_events(wait_for_fork, true),
             true
         );
+    }
+
+    #[tokio::test]
+    async fn collect_combine_picker_items_filters_to_current_provider() -> Result<()> {
+        let codex_home = tempdir()?;
+        let workspace_cwd = codex_home.path().join("workspace");
+        std::fs::create_dir_all(&workspace_cwd)?;
+        let base_thread_id = ThreadId::new();
+        let same_provider_thread_id = ThreadId::new();
+        let other_thread_id = ThreadId::new();
+        write_combine_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-00-00",
+            base_thread_id,
+            None,
+            workspace_cwd.as_path(),
+            "base thread",
+            "primary-provider",
+        )?;
+        write_combine_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-00-30",
+            same_provider_thread_id,
+            None,
+            workspace_cwd.as_path(),
+            "same provider thread",
+            "primary-provider",
+        )?;
+        write_combine_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-01-00",
+            other_thread_id,
+            None,
+            workspace_cwd.as_path(),
+            "cross provider thread",
+            "secondary-provider",
+        )?;
+
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        config.codex_home = codex_home.path().to_path_buf();
+        config.model_provider_id = "primary-provider".to_string();
+
+        let items =
+            collect_combine_picker_items(&config, base_thread_id, workspace_cwd.clone(), None)
+                .await?;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].thread_id, same_provider_thread_id);
+        assert_eq!(items[0].display_name, "same provider thread");
+        let description = items[0]
+            .description
+            .as_deref()
+            .expect("combine picker rows should include a cwd description");
+        assert_eq!(description, format!("cwd: {}", workspace_cwd.display()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collect_combine_picker_items_excludes_active_thread() -> Result<()> {
+        let codex_home = tempdir()?;
+        let workspace_cwd = codex_home.path().join("workspace");
+        std::fs::create_dir_all(&workspace_cwd)?;
+        let base_thread_id = ThreadId::new();
+        let active_thread_id = ThreadId::new();
+        write_combine_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-00-00",
+            base_thread_id,
+            None,
+            workspace_cwd.as_path(),
+            "base thread",
+            "primary-provider",
+        )?;
+        write_combine_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-01-00",
+            active_thread_id,
+            None,
+            workspace_cwd.as_path(),
+            "active thread",
+            "primary-provider",
+        )?;
+
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        config.codex_home = codex_home.path().to_path_buf();
+        config.model_provider_id = "primary-provider".to_string();
+
+        let items = collect_combine_picker_items(
+            &config,
+            base_thread_id,
+            workspace_cwd,
+            Some(active_thread_id),
+        )
+        .await?;
+
+        assert!(items.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collect_combine_picker_items_filters_by_exact_workspace() -> Result<()> {
+        let codex_home = tempdir()?;
+        let other_root = tempdir()?;
+        let base_cwd = codex_home.path().join("workspace-a");
+        let sibling_cwd = codex_home.path().join("workspace-b");
+        let other_repo_cwd = other_root.path().join("workspace-c");
+        std::fs::create_dir_all(&base_cwd)?;
+        std::fs::create_dir_all(&sibling_cwd)?;
+        std::fs::create_dir_all(&other_repo_cwd)?;
+
+        let base_thread_id = ThreadId::new();
+        let same_cwd_thread_id = ThreadId::new();
+        let sibling_cwd_thread_id = ThreadId::new();
+        let other_repo_thread_id = ThreadId::new();
+
+        write_combine_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-00-00",
+            base_thread_id,
+            None,
+            base_cwd.as_path(),
+            "base thread",
+            "primary-provider",
+        )?;
+        write_combine_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-01-00",
+            same_cwd_thread_id,
+            None,
+            base_cwd.as_path(),
+            "same cwd thread",
+            "primary-provider",
+        )?;
+        write_combine_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-02-00",
+            sibling_cwd_thread_id,
+            None,
+            sibling_cwd.as_path(),
+            "sibling cwd thread",
+            "primary-provider",
+        )?;
+        write_combine_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-03-00",
+            other_repo_thread_id,
+            None,
+            other_repo_cwd.as_path(),
+            "other repo thread",
+            "primary-provider",
+        )?;
+
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        config.codex_home = codex_home.path().to_path_buf();
+        config.model_provider_id = "primary-provider".to_string();
+
+        let items =
+            collect_combine_picker_items(&config, base_thread_id, base_cwd.clone(), None).await?;
+        let ids = items
+            .into_iter()
+            .map(|item| item.thread_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&same_cwd_thread_id));
+        assert!(!ids.contains(&sibling_cwd_thread_id));
+        assert!(!ids.contains(&other_repo_thread_id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn combine_picker_resolves_legacy_base_cwd_from_state_db() -> Result<()> {
+        let codex_home = tempdir()?;
+        let workspace = codex_home.path().join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let thread_id = ThreadId::new();
+        let rollout_path = write_empty_combine_picker_rollout(
+            codex_home.path(),
+            "2026-01-01T00-00-00",
+            thread_id,
+            None,
+            Path::new(""),
+            "primary-provider",
+        )?;
+
+        let mut config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        config.codex_home = codex_home.path().to_path_buf();
+        config.model_provider_id = "primary-provider".to_string();
+        let state_db = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("{e:#}"))?;
+        state_db
+            .mark_backfill_complete(None)
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("{e:#}"))?;
+
+        let created_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")?
+            .with_timezone(&chrono::Utc);
+        let mut builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path.clone(),
+            created_at,
+            SessionSource::Cli,
+        );
+        builder.cwd = workspace.clone();
+        state_db
+            .upsert_thread(&builder.build(config.model_provider_id.as_str()))
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("{e:#}"))?;
+
+        let resolved =
+            resolve_recorded_thread_cwd(&config, Some(thread_id), rollout_path.as_path()).await;
+        assert_eq!(resolved, Some(workspace));
+        Ok(())
     }
 
     #[tokio::test]
@@ -6405,6 +7123,8 @@ guardian_approval = true
             primary_thread_id: None,
             primary_session_configured: None,
             pending_primary_events: VecDeque::new(),
+            next_combine_request_id: 0,
+            pending_combine_picker_request_id: None,
         }
     }
 
@@ -6465,6 +7185,8 @@ guardian_approval = true
                 primary_thread_id: None,
                 primary_session_configured: None,
                 pending_primary_events: VecDeque::new(),
+                next_combine_request_id: 0,
+                pending_combine_picker_request_id: None,
             },
             rx,
             op_rx,

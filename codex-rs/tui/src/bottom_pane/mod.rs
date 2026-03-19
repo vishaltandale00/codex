@@ -56,6 +56,8 @@ pub(crate) use approval_overlay::ApprovalRequest;
 pub(crate) use approval_overlay::format_requested_permissions_rule;
 pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
 pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
+pub(crate) use multi_select_picker::MultiSelectItem;
+pub(crate) use multi_select_picker::MultiSelectPicker;
 pub(crate) use request_user_input::RequestUserInputOverlay;
 mod bottom_pane_view;
 
@@ -785,6 +787,10 @@ impl BottomPane {
         self.push_view(Box::new(view));
     }
 
+    pub(crate) fn show_multi_select_picker(&mut self, picker: MultiSelectPicker) {
+        self.push_view(Box::new(picker));
+    }
+
     /// Replace the active selection view when it matches `view_id`.
     pub(crate) fn replace_selection_view_if_active(
         &mut self,
@@ -802,6 +808,21 @@ impl BottomPane {
         self.view_stack.pop();
         let view = list_selection_view::ListSelectionView::new(params, self.app_event_tx.clone());
         self.push_view(Box::new(view));
+        true
+    }
+
+    pub(crate) fn dismiss_active_view_if_matches(&mut self, view_id: &'static str) -> bool {
+        let is_match = self
+            .view_stack
+            .last()
+            .is_some_and(|view| view.view_id() == Some(view_id));
+        if !is_match {
+            return false;
+        }
+
+        self.view_stack.pop();
+        self.on_active_view_complete();
+        self.request_redraw();
         true
     }
 

@@ -1365,10 +1365,6 @@ impl ChatComposer {
         } else {
             self.footer_mode = reset_mode_after_activity(self.footer_mode);
         }
-        let ActivePopup::Command(popup) = &mut self.active_popup else {
-            unreachable!();
-        };
-
         match key_event {
             KeyEvent {
                 code: KeyCode::Up, ..
@@ -1378,6 +1374,9 @@ impl ChatComposer {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
+                let ActivePopup::Command(popup) = &mut self.active_popup else {
+                    unreachable!();
+                };
                 popup.move_up();
                 (InputResult::None, true)
             }
@@ -1390,6 +1389,9 @@ impl ChatComposer {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
+                let ActivePopup::Command(popup) = &mut self.active_popup else {
+                    unreachable!();
+                };
                 popup.move_down();
                 (InputResult::None, true)
             }
@@ -1403,6 +1405,9 @@ impl ChatComposer {
             KeyEvent {
                 code: KeyCode::Tab, ..
             } => {
+                let ActivePopup::Command(popup) = &mut self.active_popup else {
+                    unreachable!();
+                };
                 // Ensure popup filtering/selection reflects the latest composer text
                 // before applying completion.
                 let first_line = self.textarea.text().lines().next().unwrap_or("");
@@ -1490,6 +1495,22 @@ impl ChatComposer {
                     );
                 }
 
+                if let Some((name, rest, _rest_offset)) = parse_slash_name(first_line)
+                    && rest.is_empty()
+                    && let Some(cmd) =
+                        slash_commands::find_builtin_command(name, self.builtin_command_flags())
+                {
+                    if self.reject_slash_command_if_unavailable(cmd) {
+                        return (InputResult::None, true);
+                    }
+                    self.textarea.set_text_clearing_elements("");
+                    return (InputResult::Command(cmd), true);
+                }
+
+                let ActivePopup::Command(popup) = &mut self.active_popup else {
+                    unreachable!();
+                };
+                popup.on_composer_text_change(first_line.to_string());
                 if let Some(sel) = popup.selected_item() {
                     match sel {
                         CommandItem::Builtin(cmd) => {
@@ -6547,6 +6568,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exact_slash_command_enter_ignores_stale_popup_selection() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+        type_chars_humanlike(&mut composer, &['/', 'r', 'e', 's']);
+
+        assert!(matches!(composer.active_popup, ActivePopup::Command(_)));
+        composer.textarea.set_text_clearing_elements("/combine");
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(result, InputResult::Command(SlashCommand::Combine));
+        assert!(composer.textarea.is_empty(), "composer should be cleared");
+    }
+
     fn flush_after_paste_burst(composer: &mut ChatComposer) -> bool {
         std::thread::sleep(PasteBurst::recommended_active_flush_delay());
         composer.flush_paste_burst_if_due()
@@ -6978,7 +7022,7 @@ mod tests {
         let (_result, _needs_redraw) =
             composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
-        assert_eq!(composer.textarea.text(), "/compact ");
+        assert_eq!(composer.textarea.text(), "/combine ");
         assert_eq!(composer.textarea.cursor(), composer.textarea.text().len());
     }
 

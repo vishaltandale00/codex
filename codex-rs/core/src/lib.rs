@@ -95,11 +95,17 @@ mod response_debug_context;
 pub mod review_format;
 pub mod review_prompts;
 mod seatbelt_permissions;
+mod thread_combine;
 mod thread_manager;
+mod thread_workspace;
 pub mod web_search;
 pub mod windows_sandbox_read_grants;
+pub use thread_combine::CombineSource;
+pub use thread_combine::build_combined_rollout;
 pub use thread_manager::NewThread;
 pub use thread_manager::ThreadManager;
+pub use thread_workspace::paths_match;
+pub use thread_workspace::resolve_recorded_thread_cwd;
 #[deprecated(note = "use ThreadManager")]
 pub type ConversationManager = ThreadManager;
 #[deprecated(note = "use NewThread")]

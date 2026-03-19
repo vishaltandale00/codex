@@ -26,6 +26,7 @@ pub enum SlashCommand {
     Rename,
     New,
     Resume,
+    Combine,
     Fork,
     Init,
     Compact,
@@ -75,6 +76,9 @@ impl SlashCommand {
             SlashCommand::Review => "review my current changes and find issues",
             SlashCommand::Rename => "rename the current thread",
             SlashCommand::Resume => "resume a saved chat",
+            SlashCommand::Combine => {
+                "combine selected workspace threads into a new chat (order matters)"
+            }
             SlashCommand::Clear => "clear the terminal and start a new chat",
             SlashCommand::Fork => "fork the current chat",
             // SlashCommand::Undo => "ask Codex to undo a turn",
@@ -117,7 +121,10 @@ impl SlashCommand {
     /// Command string without the leading '/'. Provided for compatibility with
     /// existing code that expects a method named `command()`.
     pub fn command(self) -> &'static str {
-        self.into()
+        match self {
+            SlashCommand::Combine => "combine",
+            _ => self.into(),
+        }
     }
 
     /// Whether this command supports inline args (for example `/review ...`).
@@ -137,6 +144,7 @@ impl SlashCommand {
         match self {
             SlashCommand::New
             | SlashCommand::Resume
+            | SlashCommand::Combine
             | SlashCommand::Fork
             | SlashCommand::Init
             | SlashCommand::Compact

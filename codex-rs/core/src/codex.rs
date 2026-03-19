@@ -1410,6 +1410,8 @@ impl Session {
         }
 
         let forked_from_id = initial_history.forked_from_id();
+        let merge_base_thread_id = initial_history.merge_base_thread_id();
+        let merged_from_thread_ids = initial_history.merged_from_thread_ids();
 
         let (conversation_id, rollout_params) = match &initial_history {
             InitialHistory::New | InitialHistory::Forked(_) => {
@@ -1419,6 +1421,8 @@ impl Session {
                     RolloutRecorderParams::new(
                         conversation_id,
                         forked_from_id,
+                        merge_base_thread_id,
+                        merged_from_thread_ids.clone(),
                         session_source,
                         BaseInstructions {
                             text: session_configuration.base_instructions.clone(),

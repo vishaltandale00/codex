@@ -1,0 +1,6 @@
+---
+source: tui/src/resume_picker.rs
+expression: snapshot
+---
+Choose a base thread to combine  Sort: Updated at
+enter to select     esc to cancel     ctrl + c to quit     tab to toggle sort

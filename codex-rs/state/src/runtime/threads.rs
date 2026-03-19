@@ -588,7 +588,8 @@ pub(super) fn extract_dynamic_tools(items: &[RolloutItem]) -> Option<Option<Vec<
         RolloutItem::ResponseItem(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
-        | RolloutItem::EventMsg(_) => None,
+        | RolloutItem::EventMsg(_)
+        | RolloutItem::MergeBoundary(_) => None,
     })
 }
 
@@ -598,10 +599,12 @@ pub(super) fn extract_memory_mode(items: &[RolloutItem]) -> Option<String> {
         RolloutItem::ResponseItem(_)
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
-        | RolloutItem::EventMsg(_) => None,
+        | RolloutItem::EventMsg(_)
+        | RolloutItem::MergeBoundary(_) => None,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn push_thread_filters<'a>(
     builder: &mut QueryBuilder<'a, Sqlite>,
     archived_only: bool,
@@ -729,6 +732,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_threads_excludes_zero_turn_threads_by_default() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let visible_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000124").expect("valid thread id");
+        let hidden_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000125").expect("valid thread id");
+
+        let mut visible = test_thread_metadata(&codex_home, visible_thread_id, codex_home.clone());
+        visible.first_user_message = Some("real question".to_string());
+        let mut hidden = test_thread_metadata(&codex_home, hidden_thread_id, codex_home.clone());
+        hidden.first_user_message = None;
+
+        runtime
+            .upsert_thread(&visible)
+            .await
+            .expect("visible thread insert should succeed");
+        runtime
+            .upsert_thread(&hidden)
+            .await
+            .expect("hidden thread insert should succeed");
+
+        let page = runtime
+            .list_threads(10, None, SortKey::UpdatedAt, &[], None, false, None)
+            .await
+            .expect("list_threads should succeed");
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, visible_thread_id);
+    }
+
+    #[tokio::test]
     async fn apply_rollout_items_restores_memory_mode_from_session_meta() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
@@ -753,6 +790,8 @@ mod tests {
             meta: SessionMeta {
                 id: thread_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: None,
                 timestamp: metadata.created_at.to_rfc3339(),
                 cwd: PathBuf::new(),
                 originator: String::new(),
@@ -807,6 +846,8 @@ mod tests {
             meta: SessionMeta {
                 id: thread_id,
                 forked_from_id: None,
+                merge_base_thread_id: None,
+                merged_from_thread_ids: None,
                 timestamp: created_at,
                 cwd: PathBuf::new(),
                 originator: String::new(),

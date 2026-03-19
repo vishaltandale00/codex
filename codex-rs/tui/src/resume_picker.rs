@@ -20,7 +20,7 @@ use codex_core::ThreadSortKey;
 use codex_core::ThreadsPage;
 use codex_core::config::Config;
 use codex_core::find_thread_names_by_ids;
-use codex_core::path_utils;
+use codex_core::paths_match;
 use codex_protocol::ThreadId;
 use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
@@ -58,6 +58,7 @@ pub enum SessionSelection {
 pub enum SessionPickerAction {
     Resume,
     Fork,
+    Combine,
 }
 
 impl SessionPickerAction {
@@ -65,6 +66,7 @@ impl SessionPickerAction {
         match self {
             SessionPickerAction::Resume => "Resume a previous session",
             SessionPickerAction::Fork => "Fork a previous session",
+            SessionPickerAction::Combine => "Choose a base thread to combine",
         }
     }
 
@@ -72,15 +74,37 @@ impl SessionPickerAction {
         match self {
             SessionPickerAction::Resume => "resume",
             SessionPickerAction::Fork => "fork",
+            SessionPickerAction::Combine => "select",
+        }
+    }
+
+    fn esc_label(self) -> &'static str {
+        match self {
+            SessionPickerAction::Resume | SessionPickerAction::Fork => "start new",
+            SessionPickerAction::Combine => "cancel",
+        }
+    }
+
+    fn esc_selection(self) -> SessionSelection {
+        match self {
+            SessionPickerAction::Resume | SessionPickerAction::Fork => SessionSelection::StartFresh,
+            SessionPickerAction::Combine => SessionSelection::Exit,
         }
     }
 
     fn selection(self, path: PathBuf, thread_id: ThreadId) -> SessionSelection {
         let target_session = SessionTarget { path, thread_id };
         match self {
-            SessionPickerAction::Resume => SessionSelection::Resume(target_session),
+            SessionPickerAction::Resume | SessionPickerAction::Combine => {
+                SessionSelection::Resume(target_session)
+            }
             SessionPickerAction::Fork => SessionSelection::Fork(target_session),
         }
+    }
+
+    fn matches_filter_cwd(self, row_cwd: &Path, filter_cwd: &Path) -> bool {
+        let _ = self;
+        paths_match(row_cwd, filter_cwd)
     }
 }
 
@@ -135,6 +159,14 @@ pub async fn run_fork_picker(
     run_session_picker(tui, config, show_all, SessionPickerAction::Fork).await
 }
 
+pub async fn run_combine_picker(
+    tui: &mut Tui,
+    config: &Config,
+    show_all: bool,
+) -> Result<SessionSelection> {
+    run_session_picker(tui, config, show_all, SessionPickerAction::Combine).await
+}
+
 async fn run_session_picker(
     tui: &mut Tui,
     config: &Config,
@@ -146,11 +178,7 @@ async fn run_session_picker(
 
     let default_provider = config.model_provider_id.to_string();
     let codex_home = config.codex_home.as_path();
-    let filter_cwd = if show_all {
-        None
-    } else {
-        std::env::current_dir().ok()
-    };
+    let filter_cwd = session_picker_filter_cwd(config, show_all);
 
     let config = config.clone();
     let loader_tx = bg_tx.clone();
@@ -165,7 +193,7 @@ async fn run_session_picker(
                 request.cursor.as_ref(),
                 request.sort_key,
                 INTERACTIVE_SESSION_SOURCES,
-                Some(provider_filter.as_slice()),
+                Some(&provider_filter),
                 request.default_provider.as_str(),
                 /*search_term*/ None,
             )
@@ -225,6 +253,10 @@ async fn run_session_picker(
 
     // Fallback – treat as cancel/new
     Ok(SessionSelection::StartFresh)
+}
+
+fn session_picker_filter_cwd(config: &Config, show_all: bool) -> Option<PathBuf> {
+    (!show_all).then(|| config.cwd.clone())
 }
 
 /// Returns the human-readable column header for the given sort key.
@@ -403,7 +435,7 @@ impl PickerState {
     async fn handle_key(&mut self, key: KeyEvent) -> Result<Option<SessionSelection>> {
         self.inline_error = None;
         match key.code {
-            KeyCode::Esc => return Ok(Some(SessionSelection::StartFresh)),
+            KeyCode::Esc => return Ok(Some(self.action.esc_selection())),
             KeyCode::Char('c')
                 if key
                     .modifiers
@@ -654,7 +686,7 @@ impl PickerState {
         let Some(row_cwd) = row.cwd.as_ref() else {
             return false;
         };
-        paths_match(row_cwd, filter_cwd)
+        self.action.matches_filter_cwd(row_cwd, filter_cwd)
     }
 
     fn set_query(&mut self, new_query: String) {
@@ -853,16 +885,6 @@ fn head_to_row(item: &ThreadItem) -> Row {
     }
 }
 
-fn paths_match(a: &Path, b: &Path) -> bool {
-    if let (Ok(ca), Ok(cb)) = (
-        path_utils::normalize_for_path_comparison(a),
-        path_utils::normalize_for_path_comparison(b),
-    ) {
-        return ca == cb;
-    }
-    a == b
-}
-
 fn parse_timestamp_str(ts: &str) -> Option<DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(ts)
         .map(|dt| dt.with_timezone(&Utc))
@@ -905,12 +927,13 @@ fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
 
         // Hint line
         let action_label = state.action.action_label();
+        let esc_label = state.action.esc_label();
         let hint_line: Line = vec![
             key_hint::plain(KeyCode::Enter).into(),
             format!(" to {action_label} ").dim(),
             "    ".dim(),
             key_hint::plain(KeyCode::Esc).into(),
-            " to start new ".dim(),
+            format!(" to {esc_label} ").dim(),
             "    ".dim(),
             key_hint::ctrl(KeyCode::Char('c')).into(),
             " to quit ".dim(),
@@ -1344,6 +1367,7 @@ fn column_visibility(
 mod tests {
     use super::*;
     use chrono::Duration;
+    use codex_core::config::ConfigBuilder;
     use codex_protocol::ThreadId;
 
     use crossterm::event::KeyCode;
@@ -1497,6 +1521,108 @@ mod tests {
         };
         let row = head_to_row(&item);
         assert_eq!(row.preview, "real question");
+    }
+
+    #[test]
+    fn head_to_row_uses_no_message_yet_for_empty_threads() {
+        let item = ThreadItem {
+            path: PathBuf::from("/tmp/a.jsonl"),
+            first_user_message: None,
+            created_at: Some("2025-01-01T00:00:00Z".into()),
+            updated_at: Some("2025-01-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        let row = head_to_row(&item);
+        assert_eq!(row.preview, "(no message yet)");
+    }
+
+    #[tokio::test]
+    async fn combine_picker_escape_cancels_instead_of_starting_fresh() {
+        let loader: PageLoader = Arc::new(|_| {});
+        let mut state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            String::from("openai"),
+            false,
+            None,
+            SessionPickerAction::Combine,
+        );
+
+        let selection = state
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .expect("esc should not abort the picker");
+
+        assert!(matches!(selection, Some(SessionSelection::Exit)));
+    }
+
+    #[test]
+    fn combine_picker_requires_exact_workspace_match() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tempdir.path().join("repo");
+        let current_cwd = repo_root.join("workspace-a");
+        let sibling_cwd = repo_root.join("workspace-b");
+        std::fs::create_dir_all(repo_root.join(".git")).expect("create git dir");
+        std::fs::create_dir_all(&current_cwd).expect("create current cwd");
+        std::fs::create_dir_all(&sibling_cwd).expect("create sibling cwd");
+
+        let loader: PageLoader = Arc::new(|_| {});
+        let state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            String::from("openai"),
+            false,
+            Some(current_cwd),
+            SessionPickerAction::Combine,
+        );
+        let row = Row {
+            path: PathBuf::from("/tmp/thread.jsonl"),
+            preview: "preview".to_string(),
+            thread_id: None,
+            thread_name: None,
+            created_at: None,
+            updated_at: None,
+            cwd: Some(sibling_cwd),
+            git_branch: None,
+        };
+
+        assert!(!state.row_matches_filter(&row));
+    }
+
+    #[test]
+    fn resume_picker_still_requires_exact_cwd_match() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let repo_root = tempdir.path().join("repo");
+        let current_cwd = repo_root.join("workspace-a");
+        let sibling_cwd = repo_root.join("workspace-b");
+        std::fs::create_dir_all(repo_root.join(".git")).expect("create git dir");
+        std::fs::create_dir_all(&current_cwd).expect("create current cwd");
+        std::fs::create_dir_all(&sibling_cwd).expect("create sibling cwd");
+
+        let loader: PageLoader = Arc::new(|_| {});
+        let state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            String::from("openai"),
+            false,
+            Some(current_cwd),
+            SessionPickerAction::Resume,
+        );
+        let row = Row {
+            path: PathBuf::from("/tmp/thread.jsonl"),
+            preview: "preview".to_string(),
+            thread_id: None,
+            thread_name: None,
+            created_at: None,
+            updated_at: None,
+            cwd: Some(sibling_cwd),
+            git_branch: None,
+        };
+
+        assert!(!state.row_matches_filter(&row));
     }
 
     #[test]
@@ -1675,6 +1801,67 @@ mod tests {
 
         let snapshot = terminal.backend().to_string();
         assert_snapshot!("resume_picker_search_error", snapshot);
+    }
+
+    #[test]
+    fn combine_picker_header_snapshot() {
+        use crate::custom_terminal::Terminal;
+        use crate::test_backend::VT100Backend;
+
+        let loader: PageLoader = Arc::new(|_| {});
+        let state = PickerState::new(
+            PathBuf::from("/tmp"),
+            FrameRequester::test_dummy(),
+            loader,
+            String::from("openai"),
+            true,
+            None,
+            SessionPickerAction::Combine,
+        );
+
+        let width: u16 = 80;
+        let height: u16 = 2;
+        let backend = VT100Backend::new(width, height);
+        let mut terminal = Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 0, width, height));
+
+        {
+            let mut frame = terminal.get_frame();
+            let area = frame.area();
+            let [header, hint] =
+                Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(area);
+            let header_line: Line = vec![
+                state.action.title().bold().cyan(),
+                "  ".into(),
+                "Sort:".dim(),
+                " ".into(),
+                sort_key_label(state.sort_key).magenta(),
+            ]
+            .into();
+            frame.render_widget_ref(header_line, header);
+
+            let action_label = state.action.action_label();
+            let esc_label = state.action.esc_label();
+            let hint_line: Line = vec![
+                key_hint::plain(KeyCode::Enter).into(),
+                format!(" to {action_label} ").dim(),
+                "    ".dim(),
+                key_hint::plain(KeyCode::Esc).into(),
+                format!(" to {esc_label} ").dim(),
+                "    ".dim(),
+                key_hint::ctrl(KeyCode::Char('c')).into(),
+                " to quit ".dim(),
+                "    ".dim(),
+                key_hint::plain(KeyCode::Tab).into(),
+                " to toggle sort ".dim(),
+            ]
+            .into();
+            frame.render_widget_ref(hint_line, hint);
+        }
+        terminal.flush().expect("flush");
+
+        let snapshot = terminal.backend().to_string();
+        assert_snapshot!("combine_picker_header", snapshot);
     }
 
     // TODO(jif) fix
@@ -2125,6 +2312,24 @@ mod tests {
         let guard = recorded_requests.lock().unwrap();
         assert_eq!(guard.len(), 2);
         assert_eq!(guard[1].sort_key, ThreadSortKey::CreatedAt);
+    }
+
+    #[tokio::test]
+    async fn session_picker_uses_configured_cwd_instead_of_process_cwd() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let config_cwd = tempdir.path().join("config");
+        std::fs::create_dir_all(&config_cwd)?;
+
+        let mut config = ConfigBuilder::default()
+            .codex_home(tempdir.path().to_path_buf())
+            .build()
+            .await?;
+        config.cwd = config_cwd.clone();
+
+        let filter_cwd = session_picker_filter_cwd(&config, false);
+
+        assert_eq!(filter_cwd, Some(config_cwd));
+        Ok(())
     }
 
     #[tokio::test]

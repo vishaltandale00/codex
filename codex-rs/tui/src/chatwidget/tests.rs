@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::app_event::AppEvent;
+use crate::app_event::CombineCandidateThread;
 use crate::app_event::ExitMode;
 #[cfg(not(target_os = "linux"))]
 use crate::app_event::RealtimeAudioDeviceKind;
@@ -618,6 +619,51 @@ async fn forked_thread_history_line_without_name_shows_id_once_snapshot() {
     let combined = lines_to_single_string(&history_cell.display_lines(80));
 
     assert_snapshot!("forked_thread_history_line_without_name", combined);
+}
+
+#[tokio::test]
+async fn combined_thread_history_line_includes_names_and_ids_snapshot() {
+    let (chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let mut chat = chat;
+    let temp = tempdir().expect("tempdir");
+    chat.config.codex_home = temp.path().to_path_buf();
+
+    let base_thread_id =
+        ThreadId::from_string("019cc2bf-bb0f-7e21-a884-df288ff96f95").expect("base id");
+    let combined_thread_id =
+        ThreadId::from_string("019cc2bf-bb0f-7e21-a884-df288ff96fa1").expect("combined id");
+    let session_index_entry = format!(
+        concat!(
+            "{{\"id\":\"{}\",\"thread_name\":\"playwright test frontend\",\"updated_at\":\"2024-01-02T00:00:00Z\"}}\n",
+            "{{\"id\":\"{}\",\"thread_name\":\"checkout smoke follow-up\",\"updated_at\":\"2024-01-03T00:00:00Z\"}}\n"
+        ),
+        base_thread_id, combined_thread_id,
+    );
+    std::fs::write(temp.path().join("session_index.jsonl"), session_index_entry)
+        .expect("write session index");
+
+    chat.emit_combined_thread_event(base_thread_id, vec![combined_thread_id]);
+
+    let history_cell = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match rx.recv().await {
+                Some(AppEvent::InsertHistoryCell(cell)) => break cell,
+                Some(_) => continue,
+                None => {
+                    panic!("app event channel closed before combined thread history was emitted")
+                }
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for combined thread history");
+    let combined = lines_to_single_string(&history_cell.display_lines(120));
+
+    assert!(
+        combined.contains("Thread combined from"),
+        "expected combine thread message in history"
+    );
+    assert_snapshot!("combined_thread_history_line", combined);
 }
 
 #[tokio::test]
@@ -6179,6 +6225,126 @@ async fn slash_resume_opens_picker() {
 }
 
 #[tokio::test]
+async fn slash_combine_opens_picker() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.dispatch_command(SlashCommand::Combine);
+
+    assert_matches!(rx.try_recv(), Ok(AppEvent::OpenCombinePicker));
+}
+
+#[tokio::test]
+async fn combine_picker_confirm_opens_review_with_selected_order() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let base_thread_id = ThreadId::new();
+    let base_path = PathBuf::from("/tmp/base.jsonl");
+    let cwd = PathBuf::from("/tmp/workspace");
+    let first_thread_id = ThreadId::new();
+    let second_thread_id = ThreadId::new();
+
+    chat.show_combine_picker(
+        base_thread_id,
+        base_path.clone(),
+        cwd.clone(),
+        vec![
+            CombineCandidateThread {
+                path: PathBuf::from("/tmp/first.jsonl"),
+                thread_id: first_thread_id,
+                display_name: "First thread".to_string(),
+                description: Some("first description".to_string()),
+            },
+            CombineCandidateThread {
+                path: PathBuf::from("/tmp/second.jsonl"),
+                thread_id: second_thread_id,
+                display_name: "Second thread".to_string(),
+                description: Some("second description".to_string()),
+            },
+        ],
+    );
+
+    chat.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Right));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Up));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Char(' ')));
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let event = rx.try_recv().expect("combine review event");
+    assert_matches!(
+        event,
+        AppEvent::OpenCombineReview {
+            base_thread_id: event_base_thread_id,
+            base_path: event_base_path,
+            combine_threads,
+            cwd: event_cwd,
+        } if event_base_thread_id == base_thread_id
+            && event_base_path == base_path
+            && event_cwd == cwd
+            && combine_threads == vec![
+                CombineCandidateThread {
+                    path: PathBuf::from("/tmp/second.jsonl"),
+                    thread_id: second_thread_id,
+                    display_name: "Second thread".to_string(),
+                    description: Some("second description".to_string()),
+                },
+                CombineCandidateThread {
+                    path: PathBuf::from("/tmp/first.jsonl"),
+                    thread_id: first_thread_id,
+                    display_name: "First thread".to_string(),
+                    description: Some("first description".to_string()),
+                },
+            ]
+    );
+}
+
+#[tokio::test]
+async fn combine_review_confirm_emits_combine_threads() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+    let base_thread_id = ThreadId::new();
+    let base_path = PathBuf::from("/tmp/base.jsonl");
+    let cwd = PathBuf::from("/tmp/workspace");
+    let combine_threads = vec![
+        CombineCandidateThread {
+            thread_id: ThreadId::new(),
+            path: PathBuf::from("/tmp/first.jsonl"),
+            display_name: "First thread".to_string(),
+            description: Some("first description".to_string()),
+        },
+        CombineCandidateThread {
+            thread_id: ThreadId::new(),
+            path: PathBuf::from("/tmp/second.jsonl"),
+            display_name: "Second thread".to_string(),
+            description: Some("second description".to_string()),
+        },
+    ];
+    let combine_thread_ids = combine_threads
+        .iter()
+        .map(|t| t.thread_id)
+        .collect::<Vec<_>>();
+
+    chat.show_combine_review(
+        base_thread_id,
+        base_path.clone(),
+        cwd.clone(),
+        combine_threads,
+    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Enter));
+
+    let event = rx.try_recv().expect("combine threads event");
+    assert_matches!(
+        event,
+        AppEvent::CombineThreads {
+            base_thread_id: event_base_thread_id,
+            base_path: event_base_path,
+            combine_thread_ids: event_combine_thread_ids,
+            cwd: event_cwd,
+        } if event_base_thread_id == base_thread_id
+            && event_base_path == base_path
+            && event_combine_thread_ids == combine_thread_ids
+            && event_cwd == cwd
+    );
+}
+
+#[tokio::test]
 async fn slash_fork_requests_current_fork() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
@@ -7950,6 +8116,66 @@ async fn full_access_confirmation_popup_snapshot() {
 
     let popup = render_bottom_popup(&chat, 80);
     assert_snapshot!("full_access_confirmation_popup", popup);
+}
+
+#[tokio::test]
+async fn combine_picker_popup_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let base_thread_id =
+        ThreadId::from_string("019cf4d1-2c4d-71e0-bdba-558bc3932ae0").expect("valid thread id");
+
+    chat.show_combine_picker(
+        base_thread_id,
+        PathBuf::from("/tmp/base.jsonl"),
+        PathBuf::from("/tmp/workspace"),
+        vec![
+            CombineCandidateThread {
+                path: PathBuf::from("/tmp/first.jsonl"),
+                thread_id: ThreadId::new(),
+                display_name: "First thread".to_string(),
+                description: Some("first description".to_string()),
+            },
+            CombineCandidateThread {
+                path: PathBuf::from("/tmp/second.jsonl"),
+                thread_id: ThreadId::new(),
+                display_name: "Second thread".to_string(),
+                description: Some("second description".to_string()),
+            },
+        ],
+    );
+
+    let popup = render_bottom_popup(&chat, 90);
+    assert_snapshot!("combine_picker_popup", popup);
+}
+
+#[tokio::test]
+async fn combine_review_popup_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(None).await;
+    let base_thread_id =
+        ThreadId::from_string("019cf4d1-7561-7823-9ffd-69e4c03aa388").expect("valid thread id");
+
+    chat.show_combine_review(
+        base_thread_id,
+        PathBuf::from("/tmp/base.jsonl"),
+        PathBuf::from("/tmp/workspace"),
+        vec![
+            CombineCandidateThread {
+                thread_id: ThreadId::new(),
+                path: PathBuf::from("/tmp/first.jsonl"),
+                display_name: "First thread".to_string(),
+                description: Some("first description".to_string()),
+            },
+            CombineCandidateThread {
+                thread_id: ThreadId::new(),
+                path: PathBuf::from("/tmp/second.jsonl"),
+                display_name: "Second thread".to_string(),
+                description: Some("second description".to_string()),
+            },
+        ],
+    );
+
+    let popup = render_bottom_popup(&chat, 90);
+    assert_snapshot!("combine_review_popup", popup);
 }
 
 #[cfg(target_os = "windows")]

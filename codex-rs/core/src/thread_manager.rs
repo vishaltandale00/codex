@@ -24,6 +24,8 @@ use crate::rollout::RolloutRecorder;
 use crate::rollout::truncation;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillsManager;
+use crate::thread_combine::CombineSource;
+use crate::thread_combine::build_combined_rollout;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::openai_models::ModelPreset;
@@ -553,6 +555,33 @@ impl ThreadManager {
         .await
     }
 
+    pub async fn combine_threads(
+        &self,
+        base_thread_id: ThreadId,
+        config: Config,
+        base_path: PathBuf,
+        combine_sources: Vec<(ThreadId, PathBuf)>,
+        parent_trace: Option<W3cTraceContext>,
+    ) -> CodexResult<NewThread> {
+        let combine_sources: Vec<CombineSource> = combine_sources
+            .into_iter()
+            .map(|(thread_id, path)| CombineSource { thread_id, path })
+            .collect();
+        let history =
+            build_combined_rollout(base_thread_id, base_path.as_path(), &combine_sources).await?;
+        Box::pin(self.state.spawn_thread(
+            config,
+            InitialHistory::Forked(history),
+            Arc::clone(&self.state.auth_manager),
+            self.agent_control(),
+            Vec::new(),
+            false,
+            /*metrics_service_name*/ None,
+            parent_trace,
+            /*user_shell_override*/ None,
+        ))
+        .await
+    }
     pub(crate) fn agent_control(&self) -> AgentControl {
         AgentControl::new(Arc::downgrade(&self.state))
     }

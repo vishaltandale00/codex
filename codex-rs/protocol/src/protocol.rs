@@ -2167,12 +2167,21 @@ impl InitialHistory {
             InitialHistory::New => None,
             InitialHistory::Resumed(resumed) => {
                 resumed.history.iter().find_map(|item| match item {
-                    RolloutItem::SessionMeta(meta_line) => meta_line.meta.forked_from_id,
+                    RolloutItem::SessionMeta(meta_line) => meta_line
+                        .meta
+                        .merge_base_thread_id
+                        .is_none()
+                        .then_some(meta_line.meta.forked_from_id)
+                        .flatten(),
                     _ => None,
                 })
             }
             InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.id),
+                RolloutItem::SessionMeta(meta_line) => meta_line
+                    .meta
+                    .merge_base_thread_id
+                    .is_none()
+                    .then_some(meta_line.meta.id),
                 _ => None,
             }),
         }
@@ -2250,6 +2259,54 @@ impl InitialHistory {
                 _ => None,
             }),
         }
+    }
+
+    pub fn merge_base_thread_id(&self) -> Option<ThreadId> {
+        match self {
+            InitialHistory::New => None,
+            InitialHistory::Resumed(resumed) => {
+                resumed.history.iter().find_map(|item| match item {
+                    RolloutItem::SessionMeta(meta_line) => meta_line.meta.merge_base_thread_id,
+                    _ => None,
+                })
+            }
+            InitialHistory::Forked(items) => items.iter().find_map(|item| match item {
+                RolloutItem::SessionMeta(meta_line) => meta_line.meta.merge_base_thread_id,
+                _ => None,
+            }),
+        }
+    }
+
+    pub fn merged_from_thread_ids(&self) -> Vec<ThreadId> {
+        let items = match self {
+            InitialHistory::New => return Vec::new(),
+            InitialHistory::Resumed(resumed) => &resumed.history,
+            InitialHistory::Forked(items) => items,
+        };
+        let session_id = items.iter().find_map(|item| match item {
+            RolloutItem::SessionMeta(meta_line) => Some(meta_line.meta.id),
+            _ => None,
+        });
+
+        let mut ids = items
+            .iter()
+            .find_map(|item| match item {
+                RolloutItem::SessionMeta(meta_line) => {
+                    meta_line.meta.merged_from_thread_ids.clone()
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut seen: HashSet<ThreadId> = ids.iter().copied().collect();
+        for item in items {
+            if let RolloutItem::MergeBoundary(boundary) = item
+                && Some(boundary.source_thread_id) != session_id
+                && seen.insert(boundary.source_thread_id)
+            {
+                ids.push(boundary.source_thread_id);
+            }
+        }
+        ids
     }
 }
 
@@ -2359,6 +2416,10 @@ pub struct SessionMeta {
     pub id: ThreadId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forked_from_id: Option<ThreadId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_base_thread_id: Option<ThreadId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_from_thread_ids: Option<Vec<ThreadId>>,
     pub timestamp: String,
     pub cwd: PathBuf,
     pub originator: String,
@@ -2387,6 +2448,8 @@ impl Default for SessionMeta {
         SessionMeta {
             id: ThreadId::default(),
             forked_from_id: None,
+            merge_base_thread_id: None,
+            merged_from_thread_ids: None,
             timestamp: String::new(),
             cwd: PathBuf::new(),
             originator: String::new(),
@@ -2414,10 +2477,16 @@ pub struct SessionMetaLine {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum RolloutItem {
     SessionMeta(SessionMetaLine),
+    MergeBoundary(MergeBoundaryItem),
     ResponseItem(ResponseItem),
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
     EventMsg(EventMsg),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
+pub struct MergeBoundaryItem {
+    pub source_thread_id: ThreadId,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
@@ -3496,6 +3565,41 @@ mod tests {
         };
         assert!(enabled.has_full_disk_write_access());
         assert!(enabled.has_full_network_access());
+    }
+
+    #[test]
+    fn merged_initial_history_does_not_report_fork_provenance() {
+        let base_thread_id = ThreadId::new();
+        let merged_thread_id = ThreadId::new();
+        let merged_from_thread_id = ThreadId::new();
+        let items = vec![RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: base_thread_id,
+                forked_from_id: Some(base_thread_id),
+                merge_base_thread_id: Some(base_thread_id),
+                merged_from_thread_ids: Some(vec![merged_from_thread_id]),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                cwd: PathBuf::from("/tmp/project"),
+                originator: "test".to_string(),
+                cli_version: "0.0.0".to_string(),
+                source: SessionSource::Cli,
+                agent_nickname: None,
+                agent_role: None,
+                model_provider: None,
+                base_instructions: None,
+                dynamic_tools: None,
+                memory_mode: None,
+            },
+            git: None,
+        })];
+        let resumed = InitialHistory::Resumed(ResumedHistory {
+            conversation_id: merged_thread_id,
+            rollout_path: PathBuf::from("/tmp/merged-rollout.jsonl"),
+            history: items.clone(),
+        });
+
+        assert_eq!(InitialHistory::Forked(items).forked_from_id(), None);
+        assert_eq!(resumed.forked_from_id(), None);
     }
 
     #[test]
